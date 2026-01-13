@@ -1,0 +1,246 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║           AUTONOMOUS AUTHORSHIP VERIFICATION SYSTEM                  ║
+║                    Quick Reference Guide                             ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 QUICK START
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Test on Synthetic Data:
+   $ python test_system.py
+
+2. Run on Real Data:
+   $ # Place Discord JSON in data/raw/
+   $ ./run_full_pipeline.sh
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 INDIVIDUAL COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHASE 1: Preprocessing
+───────────────────────────────────────────────────────────────────────
+$ python preprocess.py \
+    --raw-dir data/raw \
+    --output-dir data/processed \
+    --min-blocks 5
+
+Outputs: train.parquet, val.parquet, test.parquet
+
+
+PHASE 2: Baseline Training
+───────────────────────────────────────────────────────────────────────
+$ python train_baseline.py \
+    --train-data data/processed/train.parquet \
+    --val-data data/processed/val.parquet \
+    --output-dir models/baseline \
+    --batch-size 64 \
+    --epochs 1 \
+    --fp16
+
+Outputs: models/baseline/ (trained RoBERTa bi-encoder)
+
+
+PHASE 3A: Hard Negative Mining
+───────────────────────────────────────────────────────────────────────
+$ python miner.py \
+    --model models/baseline \
+    --data data/processed/train.parquet \
+    --output data/processed/hard_negatives.parquet \
+    --sample-size 50000 \
+    --k 10
+
+Outputs: hard_negatives.parquet (anchor, positive, negative triplets)
+
+
+PHASE 3B: Triplet Fine-tuning
+───────────────────────────────────────────────────────────────────────
+$ python train_triplet.py \
+    --model models/baseline \
+    --triplets data/processed/hard_negatives.parquet \
+    --output models/triplet_refined \
+    --batch-size 32 \
+    --margin 0.5 \
+    --fp16
+
+Outputs: models/triplet_refined/ (refined model)
+
+
+PHASE 3: Autonomous Loop (Combines 3A + 3B)
+───────────────────────────────────────────────────────────────────────
+$ python run_loop.py \
+    --base-model models/baseline \
+    --data-dir data/processed \
+    --output models/loop \
+    --iterations 3
+
+Outputs: models/loop/final_model/, results.json
+
+
+PHASE 4: Evaluation
+───────────────────────────────────────────────────────────────────────
+$ python evaluate.py \
+    --model models/loop/final_model \
+    --test-data data/processed/test.parquet \
+    --output outputs/evaluation
+
+Outputs: metrics.json, *.png visualizations
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 KEY METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Equal Error Rate (EER)
+  - Where FAR = FRR
+  - Target: < 0.05 (5%)
+  - Lower is better
+
+ROC-AUC
+  - Area under ROC curve
+  - Target: > 0.95 (95%)
+  - Higher is better
+
+Check: outputs/evaluation/metrics.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 HYPERPARAMETERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Data Processing:
+  --min-blocks 5           Min blocks per author
+  Time window: 300s        Session aggregation window
+  Token range: 20-512      Context block size
+
+Baseline Training:
+  --batch-size 64          Auto-optimized for 24GB VRAM
+  --lr 2e-5                Learning rate
+  --epochs 1               Single pass
+
+Mining:
+  --sample-size 50000      Samples to mine from
+  --k 10                   Neighbors to retrieve
+  --prioritize-same-channel  Kill topic bias
+
+Triplet Training:
+  --batch-size 32          Smaller (3x memory per sample)
+  --lr 1e-5                Lower than baseline
+  --margin 0.5             Triplet margin
+
+Loop:
+  --iterations 3           Mining cycles
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🐛 TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Out of Memory:
+  → Reduce --batch-size
+  → Reduce --sample-size (mining)
+  → Ensure --fp16 is enabled
+
+No Data Found:
+  → Check data/raw/ has .json files
+  → Verify JSON format (see README.md)
+
+Poor EER (> 0.10):
+  → Increase --iterations
+  → Increase --min-blocks (more data per author)
+  → Check data quality
+
+FAISS GPU Error:
+  → pip install faiss-gpu
+  → Use --no-gpu flag as fallback
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 OUTPUT STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data/
+├── raw/                    # Input: Discord JSON
+└── processed/              # Output: Parquet files
+    ├── train.parquet
+    ├── val.parquet
+    └── test.parquet
+
+models/
+├── baseline/               # MNRL trained model
+└── loop/                   # Autonomous loop outputs
+    ├── iteration_1/
+    │   ├── hard_negatives.parquet
+    │   ├── model/
+    │   └── evaluation/
+    ├── iteration_2/
+    ├── iteration_3/
+    ├── final_model/        # Best model
+    └── results.json
+
+outputs/
+├── baseline_evaluation/
+│   ├── metrics.json
+│   ├── roc_curve.png
+│   ├── far_frr_curves.png
+│   ├── score_distribution.png
+│   └── umap_visualization.png
+└── final_evaluation/
+    └── (same as above)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ PERFORMANCE NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Expected Runtime (10GB data, RTX 3090):
+  Preprocessing:     10-20 min  (CPU-bound)
+  Baseline training: 30-60 min  (GPU 90%+)
+  Mining (1x):       10-15 min  (GPU 80%+)
+  Triplet train (1x): 20-30 min (GPU 90%+)
+  Evaluation:        5-10 min   (GPU 70%+)
+  ─────────────────────────────────────────
+  Total (3 iters):   ~3 hours
+
+Memory Usage:
+  FP16:  ~12GB VRAM (baseline), ~8GB (triplet)
+  FP32:  ~24GB VRAM (baseline), ~16GB (triplet)
+  
+  Always use --fp16 for 24GB card!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+README.md           - Full system documentation
+IMPLEMENTATION.md   - Technical implementation details
+config.ini          - Default hyperparameters
+QUICKREF.txt        - This file
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 PRODUCTION DEPLOYMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use trained model for inference:
+
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# Load model
+model = SentenceTransformer('models/loop/final_model')
+
+# Encode texts
+text1 = "Sample message from user A"
+text2 = "Another message to compare"
+
+emb1 = model.encode(text1, normalize_embeddings=True)
+emb2 = model.encode(text2, normalize_embeddings=True)
+
+# Compute similarity
+similarity = np.dot(emb1, emb2)  # Cosine similarity
+
+# Decision (use EER threshold from metrics.json)
+threshold = 0.65  # Example from evaluation
+same_author = similarity >= threshold
+
+print(f"Similarity: {similarity:.4f}")
+print(f"Same author: {same_author}")
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For issues or questions, see README.md and IMPLEMENTATION.md
