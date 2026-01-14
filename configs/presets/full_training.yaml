@@ -1,0 +1,24 @@
+base: "../base.yaml"
+
+# Full training preset - production settings
+
+baseline_training:
+  batch_size: 64
+  num_epochs: 3  # More epochs for production
+
+triplet_training:
+  num_epochs: 2
+
+loop:
+  num_iterations: 5  # More iterations
+
+mining:
+  sample_size: 100000  # Larger sample
+
+evaluation:
+  num_positive_pairs: 4000
+  num_negative_pairs: 4000
+
+wandb:
+  enabled: true
+  log_model: true

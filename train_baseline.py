@@ -252,6 +252,8 @@ class BaselineTrainer:
                     "warmup_steps": warmup_steps,
                     "fp16": fp16,
                     "loss": "MultipleNegativesRankingLoss",
+                    "loss_scale": 100.0,
+                    "loss_temperature": 0.01,
                     "phase": "baseline_training",
                 },
             )
@@ -274,7 +276,9 @@ class BaselineTrainer:
         )
 
         # Define loss: MultipleNegativesRankingLoss (in-batch negatives)
-        train_loss = losses.MultipleNegativesRankingLoss(self.model)
+        # Scale = 1/temperature. Lower temperature (0.01) = higher scale (100.0)
+        # This creates a sharper softmax distribution, punishing close negatives harder
+        train_loss = losses.MultipleNegativesRankingLoss(self.model, scale=100.0)
 
         # Validation evaluator
         val_dataset = ValidationDataset(val_path, num_pairs=1000)

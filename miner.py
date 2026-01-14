@@ -113,22 +113,36 @@ class HardNegativeMiner:
         return index
 
     def mine_hard_negatives(
-        self, k: int = 10, prioritize_same_channel: bool = True
+        self, k: int = 10, prioritize_same_channel: bool = True,
+        min_similarity: float = 0.7, max_similarity: float = 0.95
     ) -> List[Dict]:
         """
-        Mine hard negatives using FAISS nearest neighbor search.
+        Mine hard negatives using FAISS nearest neighbor search with distance filtering.
 
         For each block:
         - Find top-k nearest neighbors
         - Filter for different authors (hard negatives)
+        - Apply distance filtering: keep negatives with min_sim < similarity < max_sim
+        - Discard if similarity > max_sim (likely duplicates/false negatives)
+        - Discard if similarity < min_sim (too easy, not hard enough)
         - Prioritize same channel if enabled (kills topic bias)
+
+        Distance filtering converts: distance = 1 - similarity
+        - distance < 0.3 means similarity > 0.7 (hard enough)
+        - distance < 0.05 means similarity > 0.95 (too hard, discard)
         """
         if self.index is None:
             raise ValueError("Must build index first")
 
-        logger.info(f"Mining hard negatives (k={k})...")
+        logger.info(f"Mining hard negatives (k={k}, {min_similarity:.2f} < sim < {max_similarity:.2f})...")
 
         triplets = []
+        filtered_stats = {
+            "too_similar": 0,  # similarity > max_sim (likely duplicates)
+            "too_dissimilar": 0,  # similarity < min_sim (too easy)
+            "same_author": 0,  # same author (not negative)
+            "kept": 0,
+        }
 
         # Search for each query
         similarities, indices = self.index.search(
@@ -154,7 +168,22 @@ class HardNegativeMiner:
 
                 # Skip if same author
                 if neighbor_author == anchor_author:
+                    filtered_stats["same_author"] += 1
                     continue
+
+                # Apply distance filtering
+                # Discard if too similar (likely duplicate/false negative)
+                if sim > max_similarity:
+                    filtered_stats["too_similar"] += 1
+                    continue
+
+                # Discard if too dissimilar (too easy, not hard enough)
+                if sim < min_similarity:
+                    filtered_stats["too_dissimilar"] += 1
+                    continue
+
+                # This is a valid hard negative
+                filtered_stats["kept"] += 1
 
                 # Calculate score (prioritize same channel)
                 score = sim
@@ -209,14 +238,29 @@ class HardNegativeMiner:
 
         logger.info(f"Mined {len(triplets)} hard triplets")
 
-        # Calculate statistics
-        same_channel_count = sum(1 for t in triplets if t["same_channel_negative"])
-        logger.info(
-            f"Same-channel negatives: {same_channel_count}/{len(triplets)} ({100 * same_channel_count / len(triplets):.1f}%)"
-        )
+        # Log filtering statistics
+        logger.info("Filtering statistics:")
+        total_candidates = sum(filtered_stats.values())
+        logger.info(f"  Total candidates examined: {total_candidates}")
+        logger.info(f"  Same author (skipped): {filtered_stats['same_author']} ({100 * filtered_stats['same_author'] / max(total_candidates, 1):.1f}%)")
+        logger.info(f"  Too similar (sim > {max_similarity}): {filtered_stats['too_similar']} ({100 * filtered_stats['too_similar'] / max(total_candidates, 1):.1f}%)")
+        logger.info(f"  Too dissimilar (sim < {min_similarity}): {filtered_stats['too_dissimilar']} ({100 * filtered_stats['too_dissimilar'] / max(total_candidates, 1):.1f}%)")
+        logger.info(f"  Kept as hard negatives: {filtered_stats['kept']} ({100 * filtered_stats['kept'] / max(total_candidates, 1):.1f}%)")
 
-        avg_sim = np.mean([t["negative_similarity"] for t in triplets])
-        logger.info(f"Average negative similarity: {avg_sim:.4f}")
+        # Calculate statistics
+        if len(triplets) > 0:
+            same_channel_count = sum(1 for t in triplets if t["same_channel_negative"])
+            logger.info(
+                f"Same-channel negatives: {same_channel_count}/{len(triplets)} ({100 * same_channel_count / len(triplets):.1f}%)"
+            )
+
+            avg_sim = np.mean([t["negative_similarity"] for t in triplets])
+            min_sim_actual = np.min([t["negative_similarity"] for t in triplets])
+            max_sim_actual = np.max([t["negative_similarity"] for t in triplets])
+            logger.info(f"Negative similarity range: [{min_sim_actual:.4f}, {max_sim_actual:.4f}]")
+            logger.info(f"Average negative similarity: {avg_sim:.4f}")
+        else:
+            logger.warning("No triplets mined! Consider relaxing distance filtering constraints.")
 
         return triplets
 
@@ -239,11 +283,15 @@ class HardNegativeMiner:
         sample_size: int = 50000,
         k: int = 10,
         prioritize_same_channel: bool = True,
+        min_similarity: float = 0.7,
+        max_similarity: float = 0.95,
     ) -> List[Dict]:
-        """Run full mining pipeline."""
+        """Run full mining pipeline with distance filtering."""
         logger.info("=" * 80)
-        logger.info("Hard Negative Mining")
+        logger.info("Hard Negative Mining with Distance Filtering")
         logger.info("=" * 80)
+        logger.info(f"Distance filtering: {min_similarity:.2f} < similarity < {max_similarity:.2f}")
+        logger.info(f"  Equivalent to: {1-max_similarity:.2f} < distance < {1-min_similarity:.2f}")
 
         # Encode
         self.encode_corpus(batch_size=batch_size, sample_size=sample_size)
@@ -253,7 +301,8 @@ class HardNegativeMiner:
 
         # Mine
         triplets = self.mine_hard_negatives(
-            k=k, prioritize_same_channel=prioritize_same_channel
+            k=k, prioritize_same_channel=prioritize_same_channel,
+            min_similarity=min_similarity, max_similarity=max_similarity
         )
 
         # Save
@@ -301,6 +350,18 @@ def main():
         default=True,
         help="Prioritize same-channel negatives",
     )
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=0.7,
+        help="Minimum similarity for hard negatives (distance < 0.3)",
+    )
+    parser.add_argument(
+        "--max-similarity",
+        type=float,
+        default=0.95,
+        help="Maximum similarity for hard negatives (distance > 0.05, avoid duplicates)",
+    )
 
     args = parser.parse_args()
 
@@ -324,6 +385,8 @@ def main():
         sample_size=args.sample_size,
         k=args.k,
         prioritize_same_channel=args.prioritize_same_channel,
+        min_similarity=args.min_similarity,
+        max_similarity=args.max_similarity,
     )
 
 

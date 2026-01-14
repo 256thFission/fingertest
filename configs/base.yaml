@@ -1,0 +1,83 @@
+# Base configuration for all experiments
+# Individual experiments inherit and override these values
+
+data:
+  train_path: "data/processed/train.parquet"
+  val_path: "data/processed/val.parquet"
+  test_path: "data/processed/test.parquet"
+  version: "v1.0"
+  min_tokens: 20
+  max_tokens: 512
+
+model:
+  base_model: "roberta-base"
+  max_seq_length: 512
+  embedding_dim: 768
+  pooling: "mean"
+
+baseline_training:
+  batch_size: 64
+  num_epochs: 1
+  learning_rate: 2.0e-5
+  warmup_steps: 1000
+  fp16: true
+  checkpoint_save_steps: 5000
+  loss:
+    type: "MultipleNegativesRankingLoss"
+    scale: 100.0
+    temperature: 0.01
+  output_dir: "models/baseline"
+
+triplet_training:
+  batch_size: 32
+  num_epochs: 1
+  learning_rate: 1.0e-5
+  fp16: true
+  warmup_ratio: 0.1
+  loss:
+    type: "TripletMarginLoss"
+    margin: 0.5
+  output_dir: "models/triplet"
+
+mining:
+  sample_size: 50000
+  k_neighbors: 10
+  batch_size: 128
+  prioritize_same_channel: true
+  min_similarity: 0.7
+  max_similarity: 0.95
+
+loop:
+  num_iterations: 3
+  output_dir: "models/loop"
+
+evaluation:
+  use_whitening: true
+  num_positive_pairs: 2000
+  num_negative_pairs: 2000
+  target_eer: 0.15
+  target_roc_auc: 0.95
+  output_dir: "outputs/evaluation"
+
+wandb:
+  enabled: true
+  project: "authorship-verification"
+  entity: "thephilliplin-duke-university/Fingerprint"
+  group: null
+  tags: []
+  log_model: true
+  log_interval: 100
+
+git:
+  require_clean: false
+  auto_commit_results: false
+
+reproducibility:
+  random_seed: 42
+  deterministic: true
+  log_system_info: true
+
+hardware:
+  vram_gb: 24
+  use_gpu: true
+  num_workers: 4

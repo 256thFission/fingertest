@@ -66,6 +66,8 @@ class AutonomousLoop:
         triplet_margin: float = 0.5,
         fp16: bool = True,
         use_wandb: bool = True,
+        min_similarity: float = 0.7,
+        max_similarity: float = 0.95,
     ):
         """Run the autonomous training loop."""
 
@@ -82,6 +84,8 @@ class AutonomousLoop:
                     "num_iterations": self.num_iterations,
                     "sample_size": sample_size,
                     "mining_k": mining_k,
+                    "min_similarity": min_similarity,
+                    "max_similarity": max_similarity,
                     "batch_size": batch_size,
                     "learning_rate": learning_rate,
                     "triplet_margin": triplet_margin,
@@ -133,6 +137,8 @@ class AutonomousLoop:
                 sample_size=sample_size,
                 k=mining_k,
                 prioritize_same_channel=True,
+                min_similarity=min_similarity,
+                max_similarity=max_similarity,
             )
 
             if not triplets:
@@ -323,6 +329,18 @@ def main():
         "--lr", type=float, default=1e-5, help="Learning rate for triplet training"
     )
     parser.add_argument("--margin", type=float, default=0.5, help="Triplet margin")
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=0.7,
+        help="Minimum similarity for hard negatives (distance < 0.3)",
+    )
+    parser.add_argument(
+        "--max-similarity",
+        type=float,
+        default=0.95,
+        help="Maximum similarity for hard negatives (distance > 0.05, avoid duplicates)",
+    )
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no-fp16", dest="fp16", action="store_false")
     parser.add_argument(
@@ -382,6 +400,8 @@ def main():
         triplet_margin=args.margin,
         fp16=args.fp16,
         use_wandb=args.wandb,
+        min_similarity=args.min_similarity,
+        max_similarity=args.max_similarity,
     )
 
 

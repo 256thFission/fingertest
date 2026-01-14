@@ -1,0 +1,19 @@
+base: "../base.yaml"
+
+# Quick testing preset - reduced sizes for fast iteration
+
+baseline_training:
+  batch_size: 16
+  num_epochs: 1
+  checkpoint_save_steps: 100
+
+mining:
+  sample_size: 1000
+  k_neighbors: 5
+
+evaluation:
+  num_positive_pairs: 100
+  num_negative_pairs: 100
+
+wandb:
+  enabled: false  # Disable for quick tests

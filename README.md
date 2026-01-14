@@ -1,326 +1,353 @@
 # Autonomous Authorship Verification System
 
-A robust, end-to-end authorship verification system that learns to map text styles to a vector space using metric learning with active hard-negative mining.
+A research project implementing metric learning for Discord message authorship verification using active hard-negative mining and dimensional collapse mitigation.
+
+## Current Status
+
+**Latest Results (2026-01-14):**
+- **EER:** 17.35% (50% improvement from 34.8% baseline)
+- **ROC-AUC:** 0.9010
+- **Method:** Whitening (mean-subtraction post-processing)
+- **Target:** EER <15%, ROC-AUC >0.95
+- **Gap:** 2.35 percentage points
+
+See [experiments/](experiments/) for detailed experiment tracking and results.
+
+## Quick Start
+
+### 1. Setup
+
+```bash
+# Clone and install dependencies
+git clone <repo-url>
+cd fingertest
+python -m venv .venv
+source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
+pip install -r requirements.txt
+
+# Login to wandb (optional but recommended)
+wandb login
+```
+
+### 2. Prepare Data
+
+You have two options depending on your data format:
+
+**Option A: Existing Parquet files** (fastest)
+```bash
+python preprocess_parquet.py --skip-channel-mapping
+```
+
+**Option B: Raw Discord JSON**
+```bash
+python preprocess.py \
+  --raw-dir data/raw \
+  --output-dir data/processed \
+  --min-blocks 5
+```
+
+**Output:** `data/processed/{train,val,test}.parquet`
+
+### 3. Train Baseline Model
+
+```bash
+python train_baseline.py \
+  --train-data data/processed/train.parquet \
+  --val-data data/processed/val.parquet \
+  --output-dir models/baseline \
+  --epochs 1 \
+  --batch-size 64 \
+  --fp16
+```
+
+**Note:** Current baseline includes dimensional collapse fix (scale=100.0, temperature=0.01).
+
+### 4. Evaluate with Whitening
+
+```bash
+python evaluate.py \
+  --model models/baseline \
+  --test-data data/processed/test.parquet \
+  --train-data data/processed/train.parquet \
+  --whitening \
+  --output outputs/evaluation
+```
+
+**Whitening** applies mean-subtraction to remove common embedding components, spreading the representation across the full hypersphere.
+
+### 5. Run Autonomous Mining Loop (Optional)
+
+```bash
+python run_loop.py \
+  --base-model models/baseline \
+  --output models/loop \
+  --iterations 3 \
+  --min-similarity 0.7 \
+  --max-similarity 0.95
+```
+
+This runs iterative hard-negative mining with distance filtering to progressively improve the model.
 
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     PHASE 1: Data Pipeline                      │
-│  Raw Discord JSON → Cleaning → Session Aggregation → Splits    │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                 PHASE 2: Baseline Training                      │
-│        RoBERTa + Mean Pooling + MNRL (In-batch Negatives)      │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│           PHASE 3: Autonomous Hard-Negative Loop                │
-│  Train → FAISS Mining → Find Hard Negatives → Retrain (3x)     │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│              PHASE 4: Forensic Evaluation                       │
-│         EER, ROC-AUC, UMAP Visualization (Zero-Shot)           │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 1: Data Pipeline                                     │
+│  Raw Data → Cleaning → Session Aggregation → Splits        │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 2: Baseline Training                                 │
+│  RoBERTa + Mean Pooling + MNRL (scale=100.0)              │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 3: Hard-Negative Mining Loop (Optional)             │
+│  FAISS Mining → Distance Filtering → TripletLoss Training  │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 4: Evaluation with Whitening                        │
+│  Mean-Subtraction → EER, ROC-AUC, UMAP Visualization      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Components
+
+### Data Pipeline
+- **Input:** Discord JSON or Parquet files (20.8M messages, 10 servers)
+- **Processing:** Session aggregation (5-min window), 20-512 tokens per block
+- **Splits:** 90% train, 10% val (same users), 1000 held-out test authors (zero-shot)
+- **Format:** Parquet with columns: `author_id`, `channel_id`, `text`, `num_messages`
+
+### Model Architecture
+```
+RoBERTa-base (125M params)
+    ↓
+Mean Pooling
+    ↓
+768-dim L2-normalized embeddings
+```
+
+### Loss Functions
+
+**Baseline (Phase 2):**
+- `MultipleNegativesRankingLoss` with scale=100.0 (temperature=0.01)
+- In-batch negatives: (batch_size - 1) negatives per anchor
+- Sharper softmax punishes close negatives harder
+
+**Refinement (Phase 3):**
+- `TripletMarginLoss` with margin=0.5
+- Uses FAISS-mined hard negatives with distance filtering
+
+### Evaluation Metrics
+- **EER (Equal Error Rate):** Point where FAR = FRR (threshold-independent)
+- **ROC-AUC:** Area under ROC curve
+- **Visualizations:** ROC curves, FAR/FRR curves, score distributions, UMAP projections
+
+### Whitening (Post-Processing)
+```python
+# Compute mean from training set
+mean_vector = np.mean(train_embeddings, axis=0)
+
+# During inference
+embedding_centered = embedding_raw - mean_vector
+embedding_final = embedding_centered / ||embedding_centered||
+```
+
+Removes "common component" from embeddings, fixing dimensional collapse (anisotropy).
+
+## Key Research Findings
+
+### Problem: Dimensional Collapse
+- **Initial EER:** 34.8% (threshold: 0.9999)
+- **Cause:** All embeddings clustered in tiny cone on hypersphere
+- **Root causes:** Dominant [CLS] token signal, weak negative samples, insufficient loss sharpness
+
+### Solution 1: Whitening ✅
+- **Implementation:** Post-processing mean-subtraction
+- **Impact:** EER 34.8% → 17.35% (50% reduction)
+- **Threshold:** 0.9999 → 0.2122 (proper spread)
+- **No retraining required**
+
+### Solution 2: Lower Temperature ✅ (Implemented, needs training)
+- **Change:** scale=100.0 (temp=0.01) vs default scale=20.0 (temp=0.05)
+- **Expected:** 3-5 pp EER improvement
+- **Status:** Code updated, needs model retraining
+
+### Solution 3: Distance Filtering ✅ (Implemented, needs training)
+- **Change:** Keep hard negatives where 0.7 < similarity < 0.95
+- **Filters:** Too similar (>0.95, likely duplicates), too dissimilar (<0.7, too easy)
+- **Expected:** 2-4 pp EER improvement
+- **Status:** Code updated, needs loop execution
+
+## Project Structure
+
+```
+fingertest/
+├── data/
+│   ├── raw/                      # Discord JSON dumps (optional)
+│   ├── {server_id}.parquet/      # Pre-processed Parquet files
+│   └── processed/                # Train/val/test splits
+│       ├── train.parquet
+│       ├── val.parquet
+│       └── test.parquet
+├── models/
+│   ├── baseline/                 # Initial MNRL model
+│   └── loop/                     # Autonomous loop outputs
+├── checkpoints/
+│   ├── model_1/                  # Saved checkpoints
+│   └── model_2/
+├── outputs/
+│   └── evaluation*/              # Evaluation results + plots
+├── experiments/                  # Experiment tracking (NEW)
+│   ├── README.md                 # Experiment log
+│   ├── EXPERIMENT_TEMPLATE.md    # Template for new experiments
+│   └── 001_*.md                  # Completed experiments
+├── preprocess.py                 # JSON → Parquet preprocessor
+├── preprocess_parquet.py         # Parquet → processed splits
+├── train_baseline.py             # Phase 2: Baseline training
+├── miner.py                      # Phase 3A: Hard-negative mining
+├── train_triplet.py              # Phase 3B: Triplet training
+├── run_loop.py                   # Phase 3: Autonomous loop
+├── evaluate.py                   # Phase 4: Evaluation
+├── config.py                     # Configuration management
+├── config.ini                    # Hyperparameters
+└── requirements.txt              # Dependencies
 ```
 
 ## Hardware Requirements
 
-- **GPU:** NVIDIA RTX 3090 (24GB VRAM) with CUDA 12
-- **RAM:** 32GB+ recommended
+- **GPU:** NVIDIA GPU with 12GB+ VRAM (tested on RTX 3090)
+- **CUDA:** 12.x for faiss-gpu-cu12
+- **RAM:** 16GB+ recommended
 - **Disk:** 20GB+ free space
-- **Python:** 3.11+ (required for faiss-gpu-cu12)
 
-## Quick Start
+## Configuration
 
-### 1. Prepare Data
+Edit `config.ini` for experiment parameters:
 
-Place your Discord JSON dumps in `data/raw/`:
-```bash
-data/raw/
-├── server1/
-│   ├── channel1.json
-│   └── channel2.json
-├── server2/
-│   └── general.json
-...
+```ini
+[baseline]
+batch_size = 64
+num_epochs = 1
+learning_rate = 2e-5
+
+[triplet]
+batch_size = 32
+margin = 0.5
+
+[mining]
+sample_size = 50000
+k = 10
+min_similarity = 0.7     # Distance filtering
+max_similarity = 0.95    # Distance filtering
+
+[wandb]
+enabled = true
+project = authorship-verification
 ```
 
-**Expected JSON format:**
-```json
-[
-  {
-    "author": {
-      "id": "123456789",
-      "username": "user123",
-      "bot": false,
-      "discriminator": "1234"
-    },
-    "content": "Message text here",
-    "timestamp": "2024-01-01T12:00:00.000Z",
-    "channel_id": "987654321"
-  },
-  ...
-]
-```
+## Running Experiments
 
-### 2. Run Full Pipeline
+### Standard Workflow
 
-```bash
-./run_full_pipeline.sh
-```
+1. **Make changes** to code/config
+2. **Copy template:** `cp experiments/EXPERIMENT_TEMPLATE.md experiments/00X_name.md`
+3. **Document hypothesis** and methodology
+4. **Run experiment** and collect metrics
+5. **Update experiment doc** with results
+6. **Update experiments/README.md** log table
+7. **Commit** with meaningful message
 
-This will:
-1. Install dependencies
-2. Preprocess data
-3. Train baseline model
-4. Run autonomous mining loop (3 iterations)
-5. Evaluate on zero-shot test set
-
-### 3. Check Results
-
-Results will be in:
-- `outputs/final_evaluation/metrics.json` - Key metrics (EER, ROC-AUC)
-- `outputs/final_evaluation/*.png` - Visualizations
-- `models/loop/final_model/` - Trained model
-
-## Manual Execution
-
-### Phase 1: Data Preprocessing
+### Useful Flags
 
 ```bash
-python preprocess.py \
-    --raw-dir data/raw \
-    --output-dir data/processed \
-    --min-blocks 5
+# Disable wandb logging
+python train_baseline.py --no-wandb
+
+# Custom wandb run name
+python train_baseline.py --wandb-name my-experiment
+
+# Adjust batch size (if OOM)
+python train_baseline.py --batch-size 32
+
+# Enable/disable whitening
+python evaluate.py --whitening      # Enable (default)
+python evaluate.py --no-whitening   # Disable
 ```
-
-**What it does:**
-- Streams 10GB+ JSON files without OOM
-- Removes bots and system messages
-- Normalizes URLs/mentions, keeps emojis
-- Aggregates messages into context blocks (20-512 tokens)
-- Creates stratified splits:
-  - Train: 90% of data from users with 5+ blocks
-  - Val: 10% of data from train users
-  - Test: 1000 held-out authors (zero-shot)
-
-### Phase 2: Baseline Training
-
-```bash
-python train_baseline.py \
-    --train-data data/processed/train.parquet \
-    --val-data data/processed/val.parquet \
-    --output-dir models/baseline \
-    --batch-size 64 \
-    --epochs 1 \
-    --lr 2e-5 \
-    --fp16
-```
-
-**Architecture:**
-- Base: `roberta-base` (125M params)
-- Pooling: Mean pooling
-- Loss: MultipleNegativesRankingLoss (in-batch negatives)
-- Output: 768-dim normalized embeddings
-
-### Phase 3: Hard-Negative Mining
-
-**Step A: Mine hard negatives**
-```bash
-python miner.py \
-    --model models/baseline \
-    --data data/processed/train.parquet \
-    --output data/processed/hard_negatives.parquet \
-    --sample-size 50000 \
-    --k 10 \
-    --prioritize-same-channel
-```
-
-**What it does:**
-- Encodes 50k random training samples
-- Builds FAISS index (GPU-accelerated)
-- For each sample, finds top-10 nearest neighbors
-- Identifies different-author neighbors as "hard negatives"
-- Prioritizes same-channel negatives (kills topic bias)
-
-**Step B: Fine-tune on triplets**
-```bash
-python train_triplet.py \
-    --model models/baseline \
-    --triplets data/processed/hard_negatives.parquet \
-    --output models/triplet_refined \
-    --batch-size 32 \
-    --epochs 1 \
-    --lr 1e-5 \
-    --margin 0.5 \
-    --fp16
-```
-
-**Loss:** TripletMarginLoss with margin=0.5
-
-### Autonomous Loop
-
-```bash
-python run_loop.py \
-    --base-model models/baseline \
-    --data-dir data/processed \
-    --output models/loop \
-    --iterations 3 \
-    --sample-size 50000 \
-    --mining-k 10 \
-    --batch-size 32 \
-    --lr 1e-5 \
-    --margin 0.5 \
-    --fp16
-```
-
-This automatically runs:
-```
-Iteration 1: Mine → Train → Evaluate
-Iteration 2: Mine → Train → Evaluate
-Iteration 3: Mine → Train → Evaluate
-```
-
-### Phase 4: Evaluation
-
-```bash
-python evaluate.py \
-    --model models/loop/final_model \
-    --test-data data/processed/test.parquet \
-    --output outputs/final_evaluation \
-    --num-positive 2000 \
-    --num-negative 2000
-```
-
-**Metrics computed:**
-- **EER (Equal Error Rate):** Target < 0.05
-- **ROC-AUC:** Area under ROC curve
-- **Accuracy at EER threshold**
-
-**Visualizations:**
-- `roc_curve.png` - ROC curve
-- `far_frr_curves.png` - FAR/FRR with EER point
-- `score_distribution.png` - Similarity distributions
-- `umap_visualization.png` - 2D embedding space
 
 ## Key Design Decisions
 
 ### 1. Streaming Data Pipeline
-- Uses generators and HuggingFace datasets to handle 10GB+ without RAM overflow
-- Processes in chunks of 10k messages
+Handles 10GB+ datasets without loading into RAM using generators and chunked processing.
 
 ### 2. Session Aggregation
-- Groups consecutive messages from (user, channel) if Δt < 5 minutes
-- Creates context-rich blocks (20-512 tokens)
-- Better than single messages for style learning
+Groups consecutive messages from same (user, channel) if Δt < 5 minutes, creating 20-512 token context blocks. Better than single messages for style learning.
 
 ### 3. Zero-Shot Test Set
-- Bottom 1000 authors completely held out
-- Model never sees these users during training
-- Tests true authorship verification capability
+Bottom 1000 authors completely held out. Model never sees these users during training, ensuring true verification capability.
 
-### 4. Hard-Negative Mining
-- Uses FAISS for fast similarity search (GPU-accelerated)
+### 4. Hard-Negative Mining with Distance Filtering
+- Uses FAISS for fast GPU-accelerated similarity search
 - Finds "confusing" examples (different authors, similar style)
-- Prioritizes same-channel negatives to reduce topic bias
+- Filters false negatives (too similar) and easy negatives (too dissimilar)
+- Goldilocks zone: 0.7 < similarity < 0.95
 
-### 5. Autonomous Loop
-- Iteratively improves by finding its own mistakes
-- Each iteration:
-  1. Identifies hard negatives (model's errors)
-  2. Retrains on these hard cases
-  3. Evaluates on zero-shot test
+### 5. Whitening for Dimensional Collapse
+Post-processing step that removes common components, spreading embeddings across full hypersphere without retraining.
 
-### 6. RoBERTa over BERT
-- Better at byte-level noise handling
-- More robust to Discord's informal text style
-
-## File Structure
-
-```
-.
-├── data/
-│   ├── raw/                    # Place Discord JSON here
-│   └── processed/              # Parquet files (train/val/test)
-├── models/
-│   ├── baseline/               # Initial MNRL model
-│   └── loop/                   # Autonomous loop outputs
-│       ├── iteration_1/
-│       ├── iteration_2/
-│       ├── iteration_3/
-│       ├── final_model/        # Best model
-│       └── results.json        # Metrics per iteration
-├── outputs/
-│   ├── baseline_evaluation/    # Baseline metrics
-│   └── final_evaluation/       # Final metrics + visualizations
-├── preprocess.py               # Phase 1: Data pipeline
-├── train_baseline.py           # Phase 2: Baseline trainer
-├── miner.py                    # Phase 3A: Hard-negative mining
-├── train_triplet.py            # Phase 3B: Triplet training
-├── run_loop.py                 # Phase 3: Autonomous loop
-├── evaluate.py                 # Phase 4: Evaluation
-├── run_full_pipeline.sh        # Master script
-└── requirements.txt            # Python dependencies
-```
-
-## Performance Tuning
-
-### Batch Size Optimization
-Auto-calculated based on VRAM:
-- Baseline training: 64-128 (MNRL)
-- Triplet training: 32 (TripletLoss has 3x overhead)
-
-### Memory Management
-- Use `fp16=True` for 2x memory savings
-- FAISS index on GPU for fast mining
-- Streaming encoders for large corpora
-
-### Hyperparameters
-Tested defaults:
-- Learning rate: 2e-5 (baseline), 1e-5 (refinement)
-- Triplet margin: 0.5
-- Mining k: 10 neighbors
-- Sample size: 50k per iteration
-
-## Expected Results
-
-| Metric | Target | Typical |
-|--------|--------|---------|
-| EER | < 0.05 | 0.03-0.06 |
-| ROC-AUC | > 0.95 | 0.94-0.98 |
-| Same-Channel Negatives | > 30% | 35-45% |
+### 6. Metric Learning over Classification
+Learns embedding space via contrastive/triplet losses instead of author classification. Generalizes to unseen authors.
 
 ## Troubleshooting
 
 ### Out of Memory (OOM)
 - Reduce `--batch-size`
+- Enable `--fp16` (should be default)
 - Reduce `--sample-size` in mining
-- Ensure `--fp16` is enabled
 
-### No Data Found
-- Check `data/raw/` has .json files
-- Verify JSON format matches expected structure
-
-### Poor EER (> 0.10)
+### Poor EER (>20%)
+- Ensure whitening is enabled: `--whitening`
+- Check if model was trained with scale=100.0
 - Increase `--iterations` in loop
-- Increase `--min-blocks` (more data per author)
-- Check data quality (enough authors?)
+- Verify data quality (enough authors with sufficient samples)
 
 ### FAISS GPU Error
-- Install: `uv pip install faiss-gpu-cu12` (CUDA 12)
-- Verify: `uv run python -c "import faiss; print(faiss.get_num_gpus())"`
-- Fallback to CPU: `--no-gpu` flag in miner.py
+```bash
+# Check GPU availability
+python -c "import faiss; print(f'GPUs: {faiss.get_num_gpus()}')"
 
-## Citation
+# If needed, fallback to CPU (slower)
+python miner.py --no-gpu
+```
 
-If you use this system, please cite:
+### Wandb Issues
+```bash
+# Login
+wandb login
+
+# Disable if needed
+export WANDB_DISABLED=1
+# or
+python train_baseline.py --no-wandb
 ```
-Autonomous Authorship Verification System
-Hard-Negative Mining Loop with RoBERTa + FAISS
-```
+
+## Next Steps
+
+See [experiments/README.md](experiments/README.md) for current experimental roadmap.
+
+**Immediate priorities:**
+1. Train new baseline with lower temperature (scale=100.0)
+2. Run autonomous loop with distance filtering (0.7-0.95 similarity)
+3. Evaluate with whitening to reach <15% EER target
+
+## References
+
+- **Sentence-Transformers:** https://www.sbert.net/
+- **FAISS:** https://github.com/facebookresearch/faiss
+- **RoBERTa:** https://arxiv.org/abs/1907.11692
+- **MultipleNegativesRankingLoss:** https://arxiv.org/abs/1705.00652
 
 ## License
 

@@ -35,12 +35,16 @@ class AuthorshipEvaluator:
     """Forensic evaluation for authorship verification."""
 
     def __init__(
-        self, model_path: str, test_data_path: str, wandb_config: Optional[dict] = None
+        self, model_path: str, test_data_path: str, wandb_config: Optional[dict] = None,
+        train_data_path: Optional[str] = None, use_whitening: bool = True
     ):
         self.model_path = Path(model_path)
         self.test_data_path = Path(test_data_path)
+        self.train_data_path = Path(train_data_path) if train_data_path else None
         self.wandb_config = wandb_config or {}
         self.wandb_run = None
+        self.use_whitening = use_whitening
+        self.mean_vector = None
 
         # Load model
         logger.info(f"Loading model from {model_path}")
@@ -63,6 +67,54 @@ class AuthorshipEvaluator:
         logger.info(
             f"Test set: {len(self.data)} blocks, {len(self.valid_authors)} authors"
         )
+
+        # Compute mean vector from training set for whitening
+        if self.use_whitening:
+            if self.train_data_path and self.train_data_path.exists():
+                logger.info("Computing mean vector from training data for whitening...")
+                self.mean_vector = self._compute_mean_vector(str(self.train_data_path))
+                logger.info(f"Mean vector computed (shape: {self.mean_vector.shape})")
+            else:
+                logger.warning("Whitening enabled but no training data path provided. Whitening will be disabled.")
+                self.use_whitening = False
+
+    def _compute_mean_vector(
+        self, train_data_path: str, max_samples: int = 50000, batch_size: int = 64
+    ) -> np.ndarray:
+        """
+        Compute mean vector from training data for whitening.
+        This removes the "common component" shared by all embeddings.
+        """
+        logger.info(f"Loading training data from {train_data_path}")
+        train_data = pq.read_table(train_data_path).to_pandas()
+
+        # Sample if too large
+        if len(train_data) > max_samples:
+            logger.info(f"Sampling {max_samples} from {len(train_data)} training samples")
+            train_data = train_data.sample(n=max_samples, random_state=42)
+
+        texts = train_data["text"].tolist()
+
+        # Encode all training texts
+        logger.info(f"Encoding {len(texts)} training samples for mean computation...")
+        all_embeddings = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="Computing mean vector"):
+            batch = texts[i : i + batch_size]
+            embeddings = self.model.encode(
+                batch,
+                batch_size=batch_size,
+                convert_to_numpy=True,
+                normalize_embeddings=False,  # Don't normalize yet
+                show_progress_bar=False,
+            )
+            all_embeddings.append(embeddings)
+
+        all_embeddings = np.vstack(all_embeddings)
+
+        # Compute mean
+        mean_vector = np.mean(all_embeddings, axis=0)
+
+        return mean_vector
 
     def generate_test_pairs(
         self, num_positive: int = 2000, num_negative: int = 2000
@@ -114,9 +166,11 @@ class AuthorshipEvaluator:
     def compute_similarities(
         self, pairs: List[Tuple[str, str]], batch_size: int = 64
     ) -> np.ndarray:
-        """Compute cosine similarities for all pairs."""
+        """Compute cosine similarities for all pairs with optional whitening."""
 
         logger.info("Computing embeddings...")
+        if self.use_whitening and self.mean_vector is not None:
+            logger.info("Whitening enabled: applying mean-subtraction before similarity computation")
 
         # Extract all unique texts
         all_texts = list(set([text for pair in pairs for text in pair]))
@@ -129,9 +183,18 @@ class AuthorshipEvaluator:
                 batch,
                 batch_size=batch_size,
                 convert_to_numpy=True,
-                normalize_embeddings=True,
+                normalize_embeddings=False,  # Don't normalize yet if whitening
                 show_progress_bar=False,
             )
+
+            # Apply whitening (mean-subtraction) if enabled
+            if self.use_whitening and self.mean_vector is not None:
+                embeddings = embeddings - self.mean_vector
+
+            # Now normalize to unit length for cosine similarity
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / (norms + 1e-8)  # Add epsilon to avoid division by zero
+
             for text, emb in zip(batch, embeddings):
                 text_to_embedding[text] = emb
 
@@ -296,8 +359,17 @@ class AuthorshipEvaluator:
 
         # Encode
         embeddings = self.model.encode(
-            texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
+            texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True,
+            normalize_embeddings=False  # Don't normalize yet if whitening
         )
+
+        # Apply whitening if enabled
+        if self.use_whitening and self.mean_vector is not None:
+            logger.info("Applying whitening to UMAP embeddings")
+            embeddings = embeddings - self.mean_vector
+            # Normalize after whitening
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / (norms + 1e-8)
 
         # UMAP
         logger.info("Running UMAP...")
@@ -358,6 +430,7 @@ class AuthorshipEvaluator:
                     "num_positive_pairs": num_positive,
                     "num_negative_pairs": num_negative,
                     "model_path": str(self.model_path),
+                    "use_whitening": self.use_whitening,
                     "phase": "evaluation",
                 },
             )
@@ -489,10 +562,13 @@ def evaluate_model(
     test_data_path: str,
     output_dir: str,
     wandb_config: Optional[dict] = None,
+    train_data_path: Optional[str] = None,
+    use_whitening: bool = True,
 ) -> Dict:
     """Convenience function for evaluation."""
     evaluator = AuthorshipEvaluator(
-        model_path, test_data_path, wandb_config=wandb_config
+        model_path, test_data_path, wandb_config=wandb_config,
+        train_data_path=train_data_path, use_whitening=use_whitening
     )
     return evaluator.evaluate(
         output_dir,
@@ -516,10 +592,28 @@ def main():
         help="Path to test data",
     )
     parser.add_argument(
+        "--train-data",
+        type=str,
+        default="data/processed/train.parquet",
+        help="Path to training data (for whitening mean vector computation)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="outputs/evaluation",
         help="Output directory for results",
+    )
+    parser.add_argument(
+        "--whitening",
+        action="store_true",
+        default=True,
+        help="Enable whitening (mean-subtraction)",
+    )
+    parser.add_argument(
+        "--no-whitening",
+        dest="whitening",
+        action="store_false",
+        help="Disable whitening",
     )
     parser.add_argument(
         "--num-positive", type=int, default=2000, help="Number of positive pairs"
@@ -570,7 +664,9 @@ def main():
     }
 
     evaluator = AuthorshipEvaluator(
-        args.model, args.test_data, wandb_config=wandb_config
+        args.model, args.test_data, wandb_config=wandb_config,
+        train_data_path=args.train_data if args.whitening else None,
+        use_whitening=args.whitening
     )
     evaluator.evaluate(
         output_dir=args.output,

@@ -1,0 +1,22 @@
+base: "../base.yaml"
+
+# Debug preset - minimal config for debugging
+
+baseline_training:
+  batch_size: 4
+  num_epochs: 1
+
+mining:
+  sample_size: 100
+  k_neighbors: 3
+
+evaluation:
+  num_positive_pairs: 20
+  num_negative_pairs: 20
+
+reproducibility:
+  deterministic: true
+  log_system_info: true
+
+wandb:
+  enabled: false
