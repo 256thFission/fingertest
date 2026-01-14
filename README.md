@@ -28,9 +28,10 @@ A robust, end-to-end authorship verification system that learns to map text styl
 
 ## Hardware Requirements
 
-- **GPU:** NVIDIA RTX 3090 (24GB VRAM)
+- **GPU:** NVIDIA RTX 3090 (24GB VRAM) with CUDA 12
 - **RAM:** 32GB+ recommended
 - **Disk:** 20GB+ free space
+- **Python:** 3.11+ (required for faiss-gpu-cu12)
 
 ## Quick Start
 
@@ -309,7 +310,8 @@ Tested defaults:
 - Check data quality (enough authors?)
 
 ### FAISS GPU Error
-- Install: `pip install faiss-gpu`
+- Install: `uv pip install faiss-gpu-cu12` (CUDA 12)
+- Verify: `uv run python -c "import faiss; print(faiss.get_num_gpus())"`
 - Fallback to CPU: `--no-gpu` flag in miner.py
 
 ## Citation

@@ -27,12 +27,6 @@ echo ""
 
 # Step 1: Install dependencies
 echo -e "${YELLOW}[Step 1] Installing dependencies...${NC}"
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    uv venv .venv
-fi
-
-source .venv/bin/activate
 uv pip install -r requirements.txt
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 echo ""
@@ -40,10 +34,7 @@ echo ""
 # Step 2: Preprocess data
 echo -e "${YELLOW}[Step 2] Preprocessing Discord data...${NC}"
 if [ ! -f "data/processed/train.parquet" ]; then
-    python preprocess.py \
-        --raw-dir data/raw \
-        --output-dir data/processed \
-        --min-blocks 5
+    uv run python preprocess_parquet.py --skip-channel-mapping
     echo -e "${GREEN}✓ Preprocessing complete${NC}"
 else
     echo "Processed data already exists. Skipping..."
@@ -53,7 +44,7 @@ echo ""
 # Step 3: Train baseline model
 echo -e "${YELLOW}[Step 3] Training baseline model with MNRL...${NC}"
 if [ ! -d "models/baseline" ]; then
-    python train_baseline.py \
+    uv run python train_baseline.py \
         --train-data data/processed/train.parquet \
         --val-data data/processed/val.parquet \
         --output-dir models/baseline \
@@ -67,7 +58,7 @@ echo ""
 
 # Step 4: Evaluate baseline
 echo -e "${YELLOW}[Step 4] Evaluating baseline model...${NC}"
-python evaluate.py \
+uv run python evaluate.py \
     --model models/baseline \
     --test-data data/processed/test.parquet \
     --output outputs/baseline_evaluation
@@ -76,7 +67,7 @@ echo ""
 
 # Step 5: Run autonomous hard-negative mining loop
 echo -e "${YELLOW}[Step 5] Starting autonomous hard-negative mining loop...${NC}"
-python run_loop.py \
+uv run python run_loop.py \
     --base-model models/baseline \
     --data-dir data/processed \
     --output models/loop \
@@ -92,7 +83,7 @@ echo ""
 
 # Step 6: Final evaluation
 echo -e "${YELLOW}[Step 6] Final evaluation on zero-shot test set...${NC}"
-python evaluate.py \
+uv run python evaluate.py \
     --model models/loop/final_model \
     --test-data data/processed/test.parquet \
     --output outputs/final_evaluation

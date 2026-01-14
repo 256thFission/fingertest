@@ -6,7 +6,7 @@ Implements EER, ROC-AUC, and visualization for authorship verification.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -17,6 +17,14 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import torch
 
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -26,9 +34,13 @@ logger = logging.getLogger(__name__)
 class AuthorshipEvaluator:
     """Forensic evaluation for authorship verification."""
 
-    def __init__(self, model_path: str, test_data_path: str):
+    def __init__(
+        self, model_path: str, test_data_path: str, wandb_config: Optional[dict] = None
+    ):
         self.model_path = Path(model_path)
         self.test_data_path = Path(test_data_path)
+        self.wandb_config = wandb_config or {}
+        self.wandb_run = None
 
         # Load model
         logger.info(f"Loading model from {model_path}")
@@ -320,12 +332,40 @@ class AuthorshipEvaluator:
         )
 
     def evaluate(
-        self, output_dir: str, num_positive: int = 2000, num_negative: int = 2000
+        self,
+        output_dir: str,
+        num_positive: int = 2000,
+        num_negative: int = 2000,
+        use_wandb: bool = True,
     ) -> Dict:
         """Run full evaluation pipeline."""
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize wandb if available and enabled
+        if use_wandb and WANDB_AVAILABLE and self.wandb_config.get("enabled", True):
+            from datetime import datetime
+
+            self.wandb_run = wandb.init(
+                project=self.wandb_config.get("project", "authorship-verification"),
+                entity=self.wandb_config.get("entity"),
+                name=self.wandb_config.get("name")
+                or f"evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                tags=self.wandb_config.get("tags", []) + ["evaluation", "phase4"],
+                notes=self.wandb_config.get("notes"),
+                config={
+                    "num_positive_pairs": num_positive,
+                    "num_negative_pairs": num_negative,
+                    "model_path": str(self.model_path),
+                    "phase": "evaluation",
+                },
+            )
+            logger.info(f"Wandb run initialized: {self.wandb_run.name}")
+        else:
+            self.wandb_run = None
+            if use_wandb and not WANDB_AVAILABLE:
+                logger.warning("Wandb not available. Install with: pip install wandb")
 
         logger.info("=" * 80)
         logger.info("Forensic Evaluation")
@@ -390,6 +430,53 @@ class AuthorshipEvaluator:
 
         logger.info(f"Metrics saved to {metrics_path}")
 
+        # Log to wandb
+        if self.wandb_run is not None:
+            # Log metrics
+            self.wandb_run.log(
+                {
+                    "eval/eer": eer,
+                    "eval/eer_threshold": eer_threshold,
+                    "eval/roc_auc": roc_auc,
+                    "eval/accuracy_at_eer": accuracy,
+                    "eval/num_test_pairs": len(pairs),
+                    "eval/num_positive_pairs": int(sum(labels)),
+                    "eval/num_negative_pairs": int(len(labels) - sum(labels)),
+                }
+            )
+
+            # Log plots
+            if (output_dir / "roc_curve.png").exists():
+                self.wandb_run.log(
+                    {"eval/roc_curve": wandb.Image(str(output_dir / "roc_curve.png"))}
+                )
+            if (output_dir / "far_frr_curves.png").exists():
+                self.wandb_run.log(
+                    {
+                        "eval/far_frr_curves": wandb.Image(
+                            str(output_dir / "far_frr_curves.png")
+                        )
+                    }
+                )
+            if (output_dir / "score_distribution.png").exists():
+                self.wandb_run.log(
+                    {
+                        "eval/score_distribution": wandb.Image(
+                            str(output_dir / "score_distribution.png")
+                        )
+                    }
+                )
+            if (output_dir / "umap_visualization.png").exists():
+                self.wandb_run.log(
+                    {
+                        "eval/umap_visualization": wandb.Image(
+                            str(output_dir / "umap_visualization.png")
+                        )
+                    }
+                )
+
+            self.wandb_run.finish()
+
         logger.info("=" * 80)
         logger.info("Evaluation complete!")
         logger.info("=" * 80)
@@ -397,10 +484,20 @@ class AuthorshipEvaluator:
         return metrics
 
 
-def evaluate_model(model_path: str, test_data_path: str, output_dir: str) -> Dict:
+def evaluate_model(
+    model_path: str,
+    test_data_path: str,
+    output_dir: str,
+    wandb_config: Optional[dict] = None,
+) -> Dict:
     """Convenience function for evaluation."""
-    evaluator = AuthorshipEvaluator(model_path, test_data_path)
-    return evaluator.evaluate(output_dir)
+    evaluator = AuthorshipEvaluator(
+        model_path, test_data_path, wandb_config=wandb_config
+    )
+    return evaluator.evaluate(
+        output_dir,
+        use_wandb=wandb_config is not None and wandb_config.get("enabled", False),
+    )
 
 
 def main():
@@ -430,6 +527,30 @@ def main():
     parser.add_argument(
         "--num-negative", type=int, default=2000, help="Number of negative pairs"
     )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        default=True,
+        help="Enable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        dest="wandb",
+        action="store_false",
+        help="Disable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="authorship-verification",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Wandb entity (username or team)",
+    )
 
     args = parser.parse_args()
 
@@ -441,11 +562,21 @@ def main():
         logger.error(f"Test data not found: {args.test_data}")
         return
 
-    evaluator = AuthorshipEvaluator(args.model, args.test_data)
+    # Prepare wandb config
+    wandb_config = {
+        "enabled": args.wandb,
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+    }
+
+    evaluator = AuthorshipEvaluator(
+        args.model, args.test_data, wandb_config=wandb_config
+    )
     evaluator.evaluate(
         output_dir=args.output,
         num_positive=args.num_positive,
         num_negative=args.num_negative,
+        use_wandb=args.wandb,
     )
 
 

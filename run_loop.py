@@ -8,11 +8,20 @@ import logging
 import shutil
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 import json
 
 from miner import HardNegativeMiner
 from train_triplet import TripletTrainer
 from evaluate import evaluate_model
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -29,11 +38,14 @@ class AutonomousLoop:
         data_dir: str = "data/processed",
         output_dir: str = "models/loop",
         num_iterations: int = 3,
+        wandb_config: Optional[dict] = None,
     ):
         self.base_model_dir = Path(base_model_dir)
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.num_iterations = num_iterations
+        self.wandb_config = wandb_config or {}
+        self.wandb_run = None
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,8 +65,35 @@ class AutonomousLoop:
         learning_rate: float = 1e-5,
         triplet_margin: float = 0.5,
         fp16: bool = True,
+        use_wandb: bool = True,
     ):
         """Run the autonomous training loop."""
+
+        # Initialize wandb if available and enabled
+        if use_wandb and WANDB_AVAILABLE and self.wandb_config.get("enabled", True):
+            self.wandb_run = wandb.init(
+                project=self.wandb_config.get("project", "authorship-verification"),
+                entity=self.wandb_config.get("entity"),
+                name=self.wandb_config.get("name")
+                or f"loop_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                tags=self.wandb_config.get("tags", []) + ["loop", "phase3"],
+                notes=self.wandb_config.get("notes"),
+                config={
+                    "num_iterations": self.num_iterations,
+                    "sample_size": sample_size,
+                    "mining_k": mining_k,
+                    "batch_size": batch_size,
+                    "learning_rate": learning_rate,
+                    "triplet_margin": triplet_margin,
+                    "fp16": fp16,
+                    "phase": "autonomous_loop",
+                },
+            )
+            logger.info(f"Wandb run initialized: {self.wandb_run.name}")
+        else:
+            self.wandb_run = None
+            if use_wandb and not WANDB_AVAILABLE:
+                logger.warning("Wandb not available. Install with: pip install wandb")
 
         logger.info("=" * 100)
         logger.info("AUTONOMOUS HARD-NEGATIVE MINING LOOP")
@@ -62,6 +101,7 @@ class AutonomousLoop:
         logger.info(f"Base model: {self.base_model_dir}")
         logger.info(f"Iterations: {self.num_iterations}")
         logger.info(f"Output: {self.output_dir}")
+        logger.info(f"Wandb: {self.wandb_run is not None}")
         logger.info("=" * 100)
 
         current_model = str(self.base_model_dir)
@@ -104,8 +144,15 @@ class AutonomousLoop:
 
             refined_model_dir = iter_dir / "model"
 
+            # Pass wandb config for nested run (or use same run)
+            trainer_wandb_config = {
+                "enabled": False,  # Disable nested wandb runs, use parent run
+            }
+
             trainer = TripletTrainer(
-                model_path=current_model, output_dir=str(refined_model_dir)
+                model_path=current_model,
+                output_dir=str(refined_model_dir),
+                wandb_config=trainer_wandb_config,
             )
 
             trainer.train(
@@ -115,7 +162,17 @@ class AutonomousLoop:
                 learning_rate=learning_rate,
                 margin=triplet_margin,
                 fp16=fp16,
+                use_wandb=False,  # We'll log to parent wandb run
+                iteration=iteration + 1,
             )
+
+            # Log to parent wandb run
+            if self.wandb_run is not None:
+                self.wandb_run.log(
+                    {
+                        f"iteration_{iteration + 1}/num_triplets": len(triplets),
+                    }
+                )
 
             # Step C: Evaluate on held-out test set
             logger.info(f"\n[Step C] Evaluating on zero-shot test set...")
@@ -139,6 +196,19 @@ class AutonomousLoop:
             logger.info(f"  EER: {metrics.get('eer', -1):.4f}")
             logger.info(f"  ROC-AUC: {metrics.get('roc_auc', -1):.4f}")
 
+            # Log iteration metrics to wandb
+            if self.wandb_run is not None:
+                self.wandb_run.log(
+                    {
+                        f"iteration_{iteration + 1}/eer": metrics.get("eer", -1),
+                        f"iteration_{iteration + 1}/roc_auc": metrics.get(
+                            "roc_auc", -1
+                        ),
+                        f"iteration_{iteration + 1}/num_triplets": len(triplets),
+                        "iteration": iteration + 1,
+                    }
+                )
+
             # Update current model for next iteration
             current_model = str(refined_model_dir)
 
@@ -157,6 +227,37 @@ class AutonomousLoop:
 
         if Path(current_model).exists():
             shutil.copytree(current_model, final_model_path, dirs_exist_ok=True)
+
+        # Finish wandb run
+        if self.wandb_run is not None:
+            # Create summary table
+            summary_data = []
+            for result in self.results:
+                summary_data.append(
+                    [
+                        result["iteration"],
+                        result["num_triplets"],
+                        result["metrics"].get("eer", -1),
+                        result["metrics"].get("roc_auc", -1),
+                    ]
+                )
+
+            table = wandb.Table(
+                columns=["Iteration", "Triplets", "EER", "ROC-AUC"], data=summary_data
+            )
+            self.wandb_run.log({"results_summary": table})
+
+            # Log final model
+            if self.wandb_config.get("log_model", True):
+                artifact = wandb.Artifact(
+                    name="loop-final-model",
+                    type="model",
+                    description="Final model after autonomous loop",
+                )
+                artifact.add_dir(str(final_model_path))
+                self.wandb_run.log_artifact(artifact)
+
+            self.wandb_run.finish()
 
         return self.results
 
@@ -224,6 +325,30 @@ def main():
     parser.add_argument("--margin", type=float, default=0.5, help="Triplet margin")
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no-fp16", dest="fp16", action="store_false")
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        default=True,
+        help="Enable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        dest="wandb",
+        action="store_false",
+        help="Disable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="authorship-verification",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Wandb entity (username or team)",
+    )
 
     args = parser.parse_args()
 
@@ -233,12 +358,20 @@ def main():
         logger.info("Please run train_baseline.py first")
         return
 
+    # Prepare wandb config
+    wandb_config = {
+        "enabled": args.wandb,
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+    }
+
     # Initialize and run loop
     loop = AutonomousLoop(
         base_model_dir=args.base_model,
         data_dir=args.data_dir,
         output_dir=args.output,
         num_iterations=args.iterations,
+        wandb_config=wandb_config,
     )
 
     loop.run(
@@ -248,6 +381,7 @@ def main():
         learning_rate=args.lr,
         triplet_margin=args.margin,
         fp16=args.fp16,
+        use_wandb=args.wandb,
     )
 
 
