@@ -13,6 +13,29 @@ A research project implementing metric learning for Discord message authorship v
 
 See [experiments/](experiments/) for detailed experiment tracking and results.
 
+## Current Status (2026-01-15)
+
+**System:**  **YAML-Based Config System - FULLY MIGRATED!**
+
+**What Works:**
+-  Create experiments with auto-incremented IDs
+-  YAML configuration with inheritance
+-  All training scripts migrated (baseline, triplet, miner, loop, evaluate)
+-  Automatic experiment tracking and documentation
+-  Enhanced wandb integration with full metadata
+-  Complete reproducibility (git hash, system info, data version)
+
+**All Scripts Migrated:**
+-  `train_baseline.py` - YAML config system
+-  `evaluate.py` - YAML config system
+-  `train_triplet.py` - YAML config system
+-  `miner.py` - YAML config system
+-  `run_loop.py` - YAML config system
+
+**See:** [`docs/SETUP_AND_USAGE.md`](docs/SETUP_AND_USAGE.md) for complete usage guide
+
+---
+
 ## Quick Start
 
 ### 1. Setup
@@ -164,18 +187,18 @@ Removes "common component" from embeddings, fixing dimensional collapse (anisotr
 - **Cause:** All embeddings clustered in tiny cone on hypersphere
 - **Root causes:** Dominant [CLS] token signal, weak negative samples, insufficient loss sharpness
 
-### Solution 1: Whitening ✅
+### Solution 1: Whitening 
 - **Implementation:** Post-processing mean-subtraction
 - **Impact:** EER 34.8% → 17.35% (50% reduction)
 - **Threshold:** 0.9999 → 0.2122 (proper spread)
 - **No retraining required**
 
-### Solution 2: Lower Temperature ✅ (Implemented, needs training)
+### Solution 2: Lower Temperature  (Implemented, needs training)
 - **Change:** scale=100.0 (temp=0.01) vs default scale=20.0 (temp=0.05)
 - **Expected:** 3-5 pp EER improvement
 - **Status:** Code updated, needs model retraining
 
-### Solution 3: Distance Filtering ✅ (Implemented, needs training)
+### Solution 3: Distance Filtering  (Implemented, needs training)
 - **Change:** Keep hard negatives where 0.7 < similarity < 0.95
 - **Filters:** Too similar (>0.95, likely duplicates), too dissimilar (<0.7, too easy)
 - **Expected:** 2-4 pp EER improvement
@@ -335,12 +358,28 @@ python train_baseline.py --no-wandb
 
 ## Next Steps
 
-See [experiments/README.md](experiments/README.md) for current experimental roadmap.
+**With New Config System:**
+1. Create new experiment: `python scripts/new_experiment.py --name my_experiment`
+2. Edit config: `configs/experiments/00X_my_experiment.yaml`
+3. Run training: `python train_baseline.py --config configs/experiments/00X_my_experiment.yaml`
+4. Results auto-logged to experiments/ and wandb
 
-**Immediate priorities:**
+**Research Priorities:**
 1. Train new baseline with lower temperature (scale=100.0)
 2. Run autonomous loop with distance filtering (0.7-0.95 similarity)
 3. Evaluate with whitening to reach <15% EER target
+
+See [experiments/README.md](experiments/README.md) for experiment tracking.
+
+## Documentation
+
+**New System:**
+-  [`docs/SETUP_AND_USAGE.md`](docs/SETUP_AND_USAGE.md) - Complete usage guide
+-  [`docs/MIGRATION_STATUS.md`](docs/MIGRATION_STATUS.md) - Migration progress
+
+**Experiments:**
+-  [`experiments/README.md`](experiments/README.md) - Experiment log
+-  [`experiments/EXPERIMENT_TEMPLATE.md`](experiments/EXPERIMENT_TEMPLATE.md) - Template
 
 ## References
 

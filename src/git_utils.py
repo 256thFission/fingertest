@@ -91,7 +91,7 @@ def require_clean_git(strict: bool = True):
                 "Set git.require_clean=false to override."
             )
         else:
-            logger.warning("⚠️  Git has uncommitted changes")
+            logger.warning("️  Git has uncommitted changes")
 
     if has_untracked_files():
-        logger.warning("⚠️  Git has untracked files")
+        logger.warning("️  Git has untracked files")

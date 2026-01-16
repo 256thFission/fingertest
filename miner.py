@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Phase 3: Hard Negative Mining with FAISS
-Finds difficult negatives (different authors with similar writing styles).
+Phase 3A: Hard Negative Mining
+FAISS-based mining with distance filtering.
+
+NOW USING: YAML Config System
 """
 
+import sys
 import logging
-import random
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Dict, Optional
 import numpy as np
-import torch
 import pandas as pd
 import pyarrow.parquet as pq
+import faiss
+import torch
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-import faiss
+
+from src.config_v2 import ExperimentConfig, apply_overrides
+from src.git_utils import get_git_info
+from src.reproducibility import set_random_seeds, get_system_info
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -27,68 +33,62 @@ class HardNegativeMiner:
 
     def __init__(
         self,
-        model_path: str,
-        data_path: str,
-        output_path: str = "data/processed/hard_negatives.parquet",
-        use_gpu: bool = True,
+        config: ExperimentConfig,
+        model_path: Optional[str] = None,
     ):
-        self.model_path = model_path
-        self.data_path = data_path
-        self.output_path = Path(output_path)
-        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.config = config
+
+        # Use provided model path or get from config
+        if model_path:
+            self.model_path = model_path
+        elif config.baseline_training:
+            self.model_path = config.baseline_training.output_dir
+        else:
+            raise ValueError("No model path found")
+
+        self.data_path = config.data.train_path
+        self.use_gpu = config.hardware.use_gpu and torch.cuda.is_available()
 
         # Load model
-        logger.info(f"Loading model from {model_path}")
-        self.model = SentenceTransformer(model_path)
+        logger.info(f"Loading model from {self.model_path}")
+        self.model = SentenceTransformer(self.model_path)
         if self.use_gpu:
             self.model = self.model.cuda()
 
         # Load data
-        logger.info(f"Loading data from {data_path}")
-        self.data = pq.read_table(data_path).to_pandas()
+        logger.info(f"Loading data from {self.data_path}")
+        self.data = pq.read_table(self.data_path).to_pandas()
         logger.info(f"Loaded {len(self.data)} blocks")
 
         self.index = None
         self.embeddings = None
 
-    def encode_corpus(
-        self, batch_size: int = 128, sample_size: int = 50000
-    ) -> np.ndarray:
-        """
-        Encode a subset of the corpus for mining.
-        Using a sample to avoid OOM and speed up mining.
-        """
+    def encode_corpus(self) -> np.ndarray:
+        """Encode a subset of the corpus for mining."""
+        cfg = self.config.mining
+
         # Sample data if needed
-        if len(self.data) > sample_size:
-            logger.info(f"Sampling {sample_size} blocks from {len(self.data)}")
-            self.data = self.data.sample(n=sample_size, random_state=42).reset_index(
-                drop=True
-            )
+        if len(self.data) > cfg.sample_size:
+            logger.info(f"Sampling {cfg.sample_size} blocks from {len(self.data)}")
+            self.data = self.data.sample(n=cfg.sample_size, random_state=42).reset_index(drop=True)
 
         texts = self.data["text"].tolist()
 
         logger.info(f"Encoding {len(texts)} texts...")
 
-        # Encode in batches
         self.embeddings = self.model.encode(
             texts,
-            batch_size=batch_size,
+            batch_size=cfg.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
-            normalize_embeddings=True,  # L2 normalize for cosine similarity
+            normalize_embeddings=True,
         )
 
         logger.info(f"Encoded embeddings shape: {self.embeddings.shape}")
         return self.embeddings
 
-    def build_index(self, use_gpu: bool = None) -> faiss.Index:
-        """
-        Build FAISS index for fast similarity search.
-        Using FlatIP (Inner Product) since embeddings are normalized (cosine similarity).
-        """
-        if use_gpu is None:
-            use_gpu = self.use_gpu
-
+    def build_index(self) -> faiss.Index:
+        """Build FAISS index for fast similarity search."""
         if self.embeddings is None:
             raise ValueError("Must encode corpus first")
 
@@ -96,298 +96,200 @@ class HardNegativeMiner:
 
         logger.info(f"Building FAISS index (dimension={dimension})...")
 
-        # Use FlatIP for exact search (Inner Product = Cosine for normalized vectors)
         index = faiss.IndexFlatIP(dimension)
 
         # Move to GPU if available
-        if use_gpu:
+        if self.use_gpu:
             logger.info("Moving index to GPU...")
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
 
-        # Add vectors
-        index.add(self.embeddings.astype("float32"))
+        index.add(self.embeddings)
 
         logger.info(f"Index built with {index.ntotal} vectors")
         self.index = index
         return index
 
-    def mine_hard_negatives(
-        self, k: int = 10, prioritize_same_channel: bool = True,
-        min_similarity: float = 0.7, max_similarity: float = 0.95
-    ) -> List[Dict]:
-        """
-        Mine hard negatives using FAISS nearest neighbor search with distance filtering.
-
-        For each block:
-        - Find top-k nearest neighbors
-        - Filter for different authors (hard negatives)
-        - Apply distance filtering: keep negatives with min_sim < similarity < max_sim
-        - Discard if similarity > max_sim (likely duplicates/false negatives)
-        - Discard if similarity < min_sim (too easy, not hard enough)
-        - Prioritize same channel if enabled (kills topic bias)
-
-        Distance filtering converts: distance = 1 - similarity
-        - distance < 0.3 means similarity > 0.7 (hard enough)
-        - distance < 0.05 means similarity > 0.95 (too hard, discard)
-        """
+    def mine_hard_negatives(self) -> pd.DataFrame:
+        """Mine hard negatives with distance filtering."""
         if self.index is None:
             raise ValueError("Must build index first")
 
-        logger.info(f"Mining hard negatives (k={k}, {min_similarity:.2f} < sim < {max_similarity:.2f})...")
+        cfg = self.config.mining
+
+        logger.info("=" * 80)
+        logger.info("Mining Hard Negatives")
+        logger.info("=" * 80)
+        logger.info(f"K-neighbors: {cfg.k_neighbors}")
+        logger.info(f"Distance filter: {cfg.min_similarity:.2f} - {cfg.max_similarity:.2f}")
+        logger.info(f"Prioritize same channel: {cfg.prioritize_same_channel}")
 
         triplets = []
-        filtered_stats = {
-            "too_similar": 0,  # similarity > max_sim (likely duplicates)
-            "too_dissimilar": 0,  # similarity < min_sim (too easy)
-            "same_author": 0,  # same author (not negative)
+        stats = {
+            "too_similar": 0,
+            "too_dissimilar": 0,
+            "same_author": 0,
             "kept": 0,
         }
 
-        # Search for each query
-        similarities, indices = self.index.search(
-            self.embeddings.astype("float32"), k + 1
-        )
+        for anchor_idx in tqdm(range(len(self.data)), desc="Mining"):
+            anchor_author = self.data.iloc[anchor_idx]["author_id"]
+            anchor_channel = self.data.iloc[anchor_idx].get("channel_id", None)
+            anchor_text = self.data.iloc[anchor_idx]["text"]
 
-        for i in tqdm(range(len(self.data)), desc="Mining"):
-            anchor_row = self.data.iloc[i]
-            anchor_author = anchor_row["author_id"]
-            anchor_channel = anchor_row["channel_id"]
+            # Find k nearest neighbors
+            anchor_emb = self.embeddings[anchor_idx : anchor_idx + 1]
+            neighbor_sims, neighbor_indices = self.index.search(anchor_emb, cfg.k_neighbors + 1)
 
-            # Get neighbors (skip first one, which is the query itself)
-            neighbor_indices = indices[i][1:]
-            neighbor_sims = similarities[i][1:]
+            neighbor_sims = neighbor_sims[0]
+            neighbor_indices = neighbor_indices[0]
 
-            # Find hard negatives (different author)
-            hard_negatives = []
+            # Find positive (same author, different text)
+            positive_idx = None
+            for idx, sim in zip(neighbor_indices, neighbor_sims):
+                if idx == anchor_idx:
+                    continue
+                if self.data.iloc[idx]["author_id"] == anchor_author:
+                    positive_idx = idx
+                    break
 
-            for neighbor_idx, sim in zip(neighbor_indices, neighbor_sims):
-                neighbor_row = self.data.iloc[neighbor_idx]
-                neighbor_author = neighbor_row["author_id"]
-                neighbor_channel = neighbor_row["channel_id"]
+            if positive_idx is None:
+                continue
 
-                # Skip if same author
-                if neighbor_author == anchor_author:
-                    filtered_stats["same_author"] += 1
+            positive_text = self.data.iloc[positive_idx]["text"]
+
+            # Find hard negative
+            hard_negative = None
+            for idx, sim in zip(neighbor_indices, neighbor_sims):
+                if idx == anchor_idx:
+                    continue
+
+                neg_author = self.data.iloc[idx]["author_id"]
+
+                # Skip same author
+                if neg_author == anchor_author:
+                    stats["same_author"] += 1
                     continue
 
                 # Apply distance filtering
-                # Discard if too similar (likely duplicate/false negative)
-                if sim > max_similarity:
-                    filtered_stats["too_similar"] += 1
+                if sim > cfg.max_similarity:
+                    stats["too_similar"] += 1
                     continue
 
-                # Discard if too dissimilar (too easy, not hard enough)
-                if sim < min_similarity:
-                    filtered_stats["too_dissimilar"] += 1
+                if sim < cfg.min_similarity:
+                    stats["too_dissimilar"] += 1
                     continue
 
-                # This is a valid hard negative
-                filtered_stats["kept"] += 1
-
-                # Calculate score (prioritize same channel)
+                # Check channel priority
                 score = sim
-                if prioritize_same_channel and neighbor_channel == anchor_channel:
-                    score += 0.1  # Boost same-channel negatives
+                if cfg.prioritize_same_channel and anchor_channel:
+                    neg_channel = self.data.iloc[idx].get("channel_id", None)
+                    if neg_channel == anchor_channel:
+                        score += 0.1
 
-                hard_negatives.append(
-                    {
-                        "idx": neighbor_idx,
-                        "similarity": float(sim),
-                        "score": float(score),
-                        "same_channel": neighbor_channel == anchor_channel,
-                    }
-                )
+                hard_negative = (idx, score)
+                break
 
-            if not hard_negatives:
+            if hard_negative is None:
                 continue
 
-            # Sort by score and take top negative
-            hard_negatives.sort(key=lambda x: x["score"], reverse=True)
-            best_negative = hard_negatives[0]
+            stats["kept"] += 1
 
-            # Now find a positive (same author, different text)
-            same_author_blocks = self.data[
-                (self.data["author_id"] == anchor_author) & (self.data.index != i)
-            ]
+            neg_idx, _ = hard_negative
+            negative_text = self.data.iloc[neg_idx]["text"]
 
-            if len(same_author_blocks) == 0:
-                continue
+            triplets.append({
+                "anchor": anchor_text,
+                "positive": positive_text,
+                "negative": negative_text,
+                "anchor_author": anchor_author,
+                "negative_author": self.data.iloc[neg_idx]["author_id"],
+            })
 
-            # Sample random positive
-            positive_idx = same_author_blocks.sample(1).index[0]
-
-            triplets.append(
-                {
-                    "anchor_text": anchor_row["text"],
-                    "anchor_author": anchor_author,
-                    "anchor_channel": anchor_channel,
-                    "positive_text": self.data.iloc[positive_idx]["text"],
-                    "positive_author": self.data.iloc[positive_idx]["author_id"],
-                    "negative_text": self.data.iloc[best_negative["idx"]]["text"],
-                    "negative_author": self.data.iloc[best_negative["idx"]][
-                        "author_id"
-                    ],
-                    "negative_channel": self.data.iloc[best_negative["idx"]][
-                        "channel_id"
-                    ],
-                    "negative_similarity": best_negative["similarity"],
-                    "same_channel_negative": best_negative["same_channel"],
-                }
-            )
-
-        logger.info(f"Mined {len(triplets)} hard triplets")
-
-        # Log filtering statistics
-        logger.info("Filtering statistics:")
-        total_candidates = sum(filtered_stats.values())
-        logger.info(f"  Total candidates examined: {total_candidates}")
-        logger.info(f"  Same author (skipped): {filtered_stats['same_author']} ({100 * filtered_stats['same_author'] / max(total_candidates, 1):.1f}%)")
-        logger.info(f"  Too similar (sim > {max_similarity}): {filtered_stats['too_similar']} ({100 * filtered_stats['too_similar'] / max(total_candidates, 1):.1f}%)")
-        logger.info(f"  Too dissimilar (sim < {min_similarity}): {filtered_stats['too_dissimilar']} ({100 * filtered_stats['too_dissimilar'] / max(total_candidates, 1):.1f}%)")
-        logger.info(f"  Kept as hard negatives: {filtered_stats['kept']} ({100 * filtered_stats['kept'] / max(total_candidates, 1):.1f}%)")
-
-        # Calculate statistics
-        if len(triplets) > 0:
-            same_channel_count = sum(1 for t in triplets if t["same_channel_negative"])
-            logger.info(
-                f"Same-channel negatives: {same_channel_count}/{len(triplets)} ({100 * same_channel_count / len(triplets):.1f}%)"
-            )
-
-            avg_sim = np.mean([t["negative_similarity"] for t in triplets])
-            min_sim_actual = np.min([t["negative_similarity"] for t in triplets])
-            max_sim_actual = np.max([t["negative_similarity"] for t in triplets])
-            logger.info(f"Negative similarity range: [{min_sim_actual:.4f}, {max_sim_actual:.4f}]")
-            logger.info(f"Average negative similarity: {avg_sim:.4f}")
-        else:
-            logger.warning("No triplets mined! Consider relaxing distance filtering constraints.")
-
-        return triplets
-
-    def save_triplets(self, triplets: List[Dict]):
-        """Save triplets to parquet."""
-        if not triplets:
-            logger.warning("No triplets to save")
-            return
-
-        df = pd.DataFrame(triplets)
-
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(self.output_path, compression="snappy")
-
-        logger.info(f"Saved {len(triplets)} triplets to {self.output_path}")
-
-    def run(
-        self,
-        batch_size: int = 128,
-        sample_size: int = 50000,
-        k: int = 10,
-        prioritize_same_channel: bool = True,
-        min_similarity: float = 0.7,
-        max_similarity: float = 0.95,
-    ) -> List[Dict]:
-        """Run full mining pipeline with distance filtering."""
+        # Log statistics
         logger.info("=" * 80)
-        logger.info("Hard Negative Mining with Distance Filtering")
+        logger.info("Mining Statistics")
         logger.info("=" * 80)
-        logger.info(f"Distance filtering: {min_similarity:.2f} < similarity < {max_similarity:.2f}")
-        logger.info(f"  Equivalent to: {1-max_similarity:.2f} < distance < {1-min_similarity:.2f}")
+        logger.info(f"Total triplets mined: {len(triplets)}")
+        logger.info(f"Filtered too similar: {stats['too_similar']}")
+        logger.info(f"Filtered too dissimilar: {stats['too_dissimilar']}")
+        logger.info(f"Filtered same author: {stats['same_author']}")
+        logger.info(f"Kept: {stats['kept']}")
+        logger.info("=" * 80)
 
-        # Encode
-        self.encode_corpus(batch_size=batch_size, sample_size=sample_size)
+        return pd.DataFrame(triplets)
+
+    def run(self, output_path: str) -> str:
+        """Complete mining pipeline."""
+        # Encode corpus
+        self.encode_corpus()
 
         # Build index
         self.build_index()
 
-        # Mine
-        triplets = self.mine_hard_negatives(
-            k=k, prioritize_same_channel=prioritize_same_channel,
-            min_similarity=min_similarity, max_similarity=max_similarity
-        )
+        # Mine hard negatives
+        triplets_df = self.mine_hard_negatives()
 
         # Save
-        self.save_triplets(triplets)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        triplets_df.to_parquet(output_path)
 
-        logger.info("=" * 80)
-        logger.info("Mining complete!")
-        logger.info("=" * 80)
-
-        return triplets
+        logger.info(f"Saved {len(triplets_df)} triplets to {output_path}")
+        return str(output_path)
 
 
 def main():
+    """Main mining function using YAML config."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Mine hard negatives with FAISS")
-    parser.add_argument(
-        "--model", type=str, default="models/baseline", help="Path to trained model"
+    parser = argparse.ArgumentParser(
+        description="Mine hard negatives using YAML configuration"
     )
     parser.add_argument(
-        "--data",
-        type=str,
-        default="data/processed/train.parquet",
-        help="Path to training data",
+        "--config",
+        required=True,
+        help="Path to experiment YAML config"
+    )
+    parser.add_argument(
+        "--model",
+        help="Override model path (optional)"
     )
     parser.add_argument(
         "--output",
-        type=str,
-        default="data/processed/hard_negatives.parquet",
-        help="Output path for mined triplets",
+        required=True,
+        help="Output path for triplets"
     )
     parser.add_argument(
-        "--sample-size", type=int, default=50000, help="Number of samples to mine from"
+        "--overrides",
+        nargs="*",
+        help="Config overrides: key=value"
     )
-    parser.add_argument(
-        "--k", type=int, default=10, help="Number of neighbors to retrieve"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=128, help="Encoding batch size"
-    )
-    parser.add_argument("--no-gpu", action="store_true", help="Disable GPU usage")
-    parser.add_argument(
-        "--prioritize-same-channel",
-        action="store_true",
-        default=True,
-        help="Prioritize same-channel negatives",
-    )
-    parser.add_argument(
-        "--min-similarity",
-        type=float,
-        default=0.7,
-        help="Minimum similarity for hard negatives (distance < 0.3)",
-    )
-    parser.add_argument(
-        "--max-similarity",
-        type=float,
-        default=0.95,
-        help="Maximum similarity for hard negatives (distance > 0.05, avoid duplicates)",
-    )
-
     args = parser.parse_args()
 
-    # Check if model exists
-    if not Path(args.model).exists():
-        logger.error(f"Model not found: {args.model}")
-        logger.info("Please run train_baseline.py first")
-        return
+    # Load config
+    logger.info(f"Loading config: {args.config}")
+    config = ExperimentConfig.from_yaml(args.config)
 
-    # Initialize miner
-    miner = HardNegativeMiner(
-        model_path=args.model,
-        data_path=args.data,
-        output_path=args.output,
-        use_gpu=not args.no_gpu,
-    )
+    if args.overrides:
+        config = apply_overrides(config, args.overrides)
 
-    # Run mining
-    miner.run(
-        batch_size=args.batch_size,
-        sample_size=args.sample_size,
-        k=args.k,
-        prioritize_same_channel=args.prioritize_same_channel,
-        min_similarity=args.min_similarity,
-        max_similarity=args.max_similarity,
-    )
+    # Validate
+    errors = config.validate()
+    if errors:
+        logger.error("Config validation failed:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        sys.exit(1)
+
+    # Set seeds
+    set_random_seeds(config.reproducibility.random_seed)
+
+    # Mine
+    miner = HardNegativeMiner(config, model_path=args.model)
+    triplet_path = miner.run(args.output)
+
+    logger.info(f" Mining complete: {triplet_path}")
 
 
 if __name__ == "__main__":

@@ -29,20 +29,20 @@ def main():
     # Load config
     try:
         config = ExperimentConfig.from_yaml(config_path)
-        print("✅ Config loaded successfully")
+        print(" Config loaded successfully")
     except Exception as e:
-        print(f"❌ Failed to load config: {e}")
+        print(f" Failed to load config: {e}")
         sys.exit(1)
 
     # Validate
     errors = config.validate()
     if errors:
-        print("\n❌ Validation errors:")
+        print("\n Validation errors:")
         for error in errors:
             print(f"  - {error}")
         sys.exit(1)
 
-    print("✅ Config is valid")
+    print(" Config is valid")
 
     # Check paths
     print("\n" + "=" * 80)
@@ -58,9 +58,9 @@ def main():
     all_paths_exist = True
     for name, path in path_checks:
         if Path(path).exists():
-            print(f"  ✅ {name}: {path}")
+            print(f"   {name}: {path}")
         else:
-            print(f"  ❌ {name}: {path} (NOT FOUND)")
+            print(f"   {name}: {path} (NOT FOUND)")
             all_paths_exist = False
 
     # Check git
@@ -74,17 +74,17 @@ def main():
         print(f"  Commit: {git_info['hash_short']}")
 
         if git_info.get('dirty'):
-            print(f"  ⚠️  Uncommitted changes detected")
+            print(f"  ️  Uncommitted changes detected")
             if config.git.require_clean:
-                print(f"  ❌ Config requires clean git (git.require_clean: true)")
+                print(f"   Config requires clean git (git.require_clean: true)")
                 all_paths_exist = False
         else:
-            print(f"  ✅ Clean git state")
+            print(f"   Clean git state")
 
         if git_info.get('untracked'):
-            print(f"  ⚠️  Untracked files detected")
+            print(f"  ️  Untracked files detected")
     except Exception as e:
-        print(f"  ⚠️  Git info unavailable: {e}")
+        print(f"  ️  Git info unavailable: {e}")
 
     # Summary
     print("\n" + "=" * 80)
@@ -116,12 +116,12 @@ def main():
     print("\n" + "=" * 80)
 
     if all_paths_exist and not errors:
-        print("✅ Config ready to use!")
+        print(" Config ready to use!")
         print(f"\nRun:")
         print(f"  python train_baseline.py --config {config_path}")
         sys.exit(0)
     else:
-        print("❌ Config has issues, please fix before running")
+        print(" Config has issues, please fix before running")
         sys.exit(1)
 
 

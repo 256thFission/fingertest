@@ -52,16 +52,16 @@ def main():
                 auc = f"{auc:.4f}"
 
             status_emoji = {
-                "planning": "📝",
-                "running": "🔄",
-                "complete": "✅",
-                "failed": "❌",
-            }.get(config.experiment.status, "❓")
+                "planning": "",
+                "running": "",
+                "complete": "",
+                "failed": "",
+            }.get(config.experiment.status, "")
 
             print(f"{config.experiment.id:<5} {config.experiment.name:<30} {status_emoji} {config.experiment.status:<13} {eer:<10} {auc:<10}")
 
         except Exception as e:
-            print(f"⚠️  Failed to load {config_file.name}: {e}")
+            print(f"️  Failed to load {config_file.name}: {e}")
 
     print("=" * 80)
 

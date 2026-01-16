@@ -188,8 +188,8 @@ class ExperimentTracker:
 
 | Metric | Value | Target | Status |
 |--------|-------|--------|--------|
-| **EER** | {eer:.2%}{eer_delta} | {target_eer:.2%} | {'✅' if eer <= target_eer else '❌'} |
-| **ROC-AUC** | {roc_auc:.4f}{auc_delta} | {target_auc:.4f} | {'✅' if roc_auc >= target_auc else '❌'} |
+| **EER** | {eer:.2%}{eer_delta} | {target_eer:.2%} | {'' if eer <= target_eer else ''} |
+| **ROC-AUC** | {roc_auc:.4f}{auc_delta} | {target_auc:.4f} | {'' if roc_auc >= target_auc else ''} |
 | **EER Threshold** | {metrics.get('eer_threshold', 'N/A'):.4f} | - | - |
 | **Accuracy @ EER** | {metrics.get('accuracy_at_eer', 'N/A'):.2%} | - | - |
 
@@ -315,11 +315,11 @@ class ExperimentTracker:
     def _status_emoji(self, status: str) -> str:
         """Get emoji for status."""
         return {
-            "planning": "📝",
-            "running": "🔄",
-            "complete": "✅",
-            "failed": "❌",
-        }.get(status.lower(), "❓")
+            "planning": "",
+            "running": "",
+            "complete": "",
+            "failed": "",
+        }.get(status.lower(), "")
 
     def _insert_log_row(self, content: str, new_row: str) -> str:
         """Insert new row into log table."""

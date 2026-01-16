@@ -41,7 +41,7 @@ def main():
     parser.add_argument(
         "--name",
         required=True,
-        help="Experiment name (snake_case)"
+        help="Experiment name"
     )
     parser.add_argument(
         "--description",
@@ -57,16 +57,11 @@ def main():
     )
     parser.add_argument(
         "--preset",
-        choices=["base", "quick_test", "debug", "full_training"],
+        choices=["base", "test", "debug", "full_training"],
         default="base",
         help="Preset to base config on"
     )
     args = parser.parse_args()
-
-    # Validate name
-    if not re.match(r'^[a-z0-9_]+$', args.name):
-        print("❌ Name must be snake_case (lowercase letters, numbers, underscores only)")
-        sys.exit(1)
 
     # Get next ID
     exp_id = get_next_experiment_id()
@@ -74,7 +69,7 @@ def main():
     # Check if experiment with this name already exists
     config_path = Path(f"configs/experiments/{exp_id}_{args.name}.yaml")
     if config_path.exists():
-        print(f"❌ Experiment already exists: {config_path}")
+        print(f" Experiment already exists: {config_path}")
         sys.exit(1)
 
     # Determine base config
@@ -106,7 +101,7 @@ def main():
     with open(config_path, "w") as f:
         yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
-    print(f"✅ Created config: {config_path}")
+    print(f" Created config: {config_path}")
 
     # Create experiment doc
     doc_path = Path(f"experiments/{exp_id}_{args.name}.md")
@@ -114,13 +109,13 @@ def main():
     with open(doc_path, "w") as f:
         f.write(doc_content)
 
-    print(f"✅ Created doc: {doc_path}")
+    print(f" Created doc: {doc_path}")
 
     # Update experiment log
     update_experiment_log(config)
 
-    print(f"\n✅ Experiment {exp_id} created!")
-    print(f"\n📝 Next steps:")
+    print(f"\n Experiment {exp_id} created!")
+    print(f"\n Next steps:")
     print(f"1. Edit config: {config_path}")
     print(f"2. Update hypothesis in: {doc_path}")
     print(f"3. Run training:")
@@ -179,7 +174,7 @@ def update_experiment_log(config: dict):
 
     exp = config["experiment"]
     date = datetime.now().strftime("%Y-%m-%d")
-    new_row = f"| {exp['id']} | {date} | [{exp['name']}]({exp['id']}_{exp['name']}.md) | 📝 Planning | - | - |"
+    new_row = f"| {exp['id']} | {date} | [{exp['name']}]({exp['id']}_{exp['name']}.md) |  Planning | - | - |"
 
     content = log_path.read_text()
 
@@ -193,7 +188,7 @@ def update_experiment_log(config: dict):
                 break
 
     log_path.write_text("\n".join(lines))
-    print(f"✅ Updated experiment log")
+    print(f" Updated experiment log")
 
 
 if __name__ == "__main__":

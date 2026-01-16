@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Triplet Training: Fine-tune model on hard negatives with TripletMarginLoss.
+Phase 3B: Triplet Fine-tuning
+Fine-tunes model on hard negative triplets with TripletMarginLoss.
+
+NOW USING: YAML Config System
 """
 
+import sys
 import logging
 from pathlib import Path
 from typing import Optional
 import torch
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from sentence_transformers import SentenceTransformer, InputExample, losses
-from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
+
+from src.config_v2 import ExperimentConfig, apply_overrides
+from src.wandb_utils import init_wandb_with_metadata, log_model_artifact
+from src.git_utils import get_git_info
+from src.reproducibility import set_random_seeds, get_system_info
 
 try:
     import wandb
-
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
-    wandb = None
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -39,7 +46,7 @@ class TripletDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         return InputExample(
-            texts=[row["anchor_text"], row["positive_text"], row["negative_text"]]
+            texts=[row["anchor"], row["positive"], row["negative"]]
         )
 
 
@@ -47,209 +54,177 @@ class TripletTrainer:
     """Fine-tune model on hard negative triplets."""
 
     def __init__(
-        self, model_path: str, output_dir: str, wandb_config: Optional[dict] = None
-    ):
-        self.model_path = Path(model_path)
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.wandb_config = wandb_config or {}
-        self.wandb_run = None
-
-        logger.info(f"Loading model from {model_path}")
-        self.model = SentenceTransformer(str(model_path))
-
-    def train(
         self,
-        triplet_path: str,
-        batch_size: int = 32,
-        num_epochs: int = 1,
-        learning_rate: float = 1e-5,
-        margin: float = 0.5,
-        fp16: bool = True,
-        use_wandb: bool = True,
-        iteration: Optional[int] = None,
+        config: ExperimentConfig,
+        wandb_run: Optional["wandb.Run"] = None,
+        model_path: Optional[str] = None,
+        iteration: Optional[int] = None
     ):
-        """Train on triplets with TripletMarginLoss."""
+        self.config = config
+        self.wandb_run = wandb_run
+        self.iteration = iteration
 
-        # Initialize wandb if available and enabled
-        if use_wandb and WANDB_AVAILABLE and self.wandb_config.get("enabled", True):
-            run_name = self.wandb_config.get("name")
-            if run_name is None:
-                run_name = f"triplet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                if iteration is not None:
-                    run_name += f"_iter{iteration}"
-
-            self.wandb_run = wandb.init(
-                project=self.wandb_config.get("project", "authorship-verification"),
-                entity=self.wandb_config.get("entity"),
-                name=run_name,
-                tags=self.wandb_config.get("tags", []) + ["triplet", "phase3b"],
-                notes=self.wandb_config.get("notes"),
-                config={
-                    "batch_size": batch_size,
-                    "num_epochs": num_epochs,
-                    "learning_rate": learning_rate,
-                    "margin": margin,
-                    "fp16": fp16,
-                    "loss": "TripletLoss",
-                    "phase": "triplet_training",
-                    "iteration": iteration,
-                },
-            )
-            logger.info(f"Wandb run initialized: {self.wandb_run.name}")
+        # Use provided model path or get from config
+        if model_path:
+            self.model_path = Path(model_path)
+        elif config.baseline_training:
+            self.model_path = Path(config.baseline_training.output_dir)
         else:
-            self.wandb_run = None
-            if use_wandb and not WANDB_AVAILABLE:
-                logger.warning("Wandb not available. Install with: pip install wandb")
+            raise ValueError("No model path found")
+
+        self.output_dir = Path(config.triplet_training.output_dir)
+        if iteration is not None:
+            self.output_dir = self.output_dir.parent / f"iteration_{iteration}" / "model"
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Loading model from {self.model_path}")
+        self.model = SentenceTransformer(str(self.model_path))
+
+    def train(self, triplet_path: str):
+        """Train on triplets with TripletMarginLoss."""
+        cfg = self.config.triplet_training
 
         logger.info("=" * 80)
         logger.info("Triplet Fine-tuning")
+        if self.iteration is not None:
+            logger.info(f"Iteration: {self.iteration}")
         logger.info("=" * 80)
 
-        # Load triplet dataset
+        # Load dataset
         dataset = TripletDataset(triplet_path)
         dataloader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=4
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=self.config.hardware.num_workers
         )
 
-        # Define triplet loss
+        # Define loss
         train_loss = losses.TripletLoss(
             model=self.model,
             distance_metric=losses.TripletDistanceMetric.COSINE,
-            triplet_margin=margin,
+            triplet_margin=cfg.loss.margin,
         )
 
         steps_per_epoch = len(dataloader)
-        warmup_steps = int(steps_per_epoch * 0.1)  # 10% warmup
+        warmup_steps = int(steps_per_epoch * cfg.warmup_ratio)
 
         logger.info(f"Training configuration:")
-        logger.info(f"  Triplets: {len(dataset)}")
-        logger.info(f"  Batch size: {batch_size}")
-        logger.info(f"  Epochs: {num_epochs}")
-        logger.info(f"  Learning rate: {learning_rate}")
-        logger.info(f"  Margin: {margin}")
+        logger.info(f"  Batch size: {cfg.batch_size}")
+        logger.info(f"  Epochs: {cfg.num_epochs}")
+        logger.info(f"  Steps per epoch: {steps_per_epoch}")
+        logger.info(f"  Learning rate: {cfg.learning_rate}")
+        logger.info(f"  Margin: {cfg.loss.margin}")
         logger.info(f"  Warmup steps: {warmup_steps}")
-        logger.info(f"  FP16: {fp16}")
-        logger.info(f"  Wandb: {self.wandb_run is not None}")
+        logger.info(f"  FP16: {cfg.fp16}")
 
-        # Log dataset info to wandb
-        if self.wandb_run is not None:
-            self.wandb_run.log(
-                {
-                    "dataset/num_triplets": len(dataset),
-                    "config/warmup_steps": warmup_steps,
-                    "config/steps_per_epoch": steps_per_epoch,
-                }
-            )
+        if self.wandb_run:
+            self.wandb_run.log({
+                "triplet/num_triplets": len(dataset),
+                "triplet/steps_per_epoch": steps_per_epoch,
+                "triplet/iteration": self.iteration or 0,
+            })
 
         # Train
         self.model.fit(
             train_objectives=[(dataloader, train_loss)],
-            epochs=num_epochs,
+            epochs=cfg.num_epochs,
             warmup_steps=warmup_steps,
-            optimizer_params={"lr": learning_rate},
+            optimizer_params={"lr": cfg.learning_rate},
             output_path=str(self.output_dir),
-            save_best_model=True,
-            use_amp=fp16,
             show_progress_bar=True,
+            use_amp=cfg.fp16,
         )
 
         logger.info("=" * 80)
-        logger.info(f"Fine-tuning complete! Model saved to {self.output_dir}")
+        logger.info("Triplet Training Complete!")
+        logger.info(f"Model saved to: {self.output_dir}")
         logger.info("=" * 80)
 
-        # Finish wandb run
-        if self.wandb_run is not None:
-            # Log final model artifact
-            if self.wandb_config.get("log_model", True):
-                artifact = wandb.Artifact(
-                    name=f"triplet-model",
-                    type="model",
-                    description="Triplet-refined authorship verification model",
-                )
-                artifact.add_dir(str(self.output_dir))
-                self.wandb_run.log_artifact(artifact)
+        # Log model artifact
+        if self.wandb_run and self.config.wandb.log_model:
+            log_model_artifact(
+                self.wandb_run,
+                self.output_dir,
+                self.config.experiment.id,
+                artifact_type="triplet_model"
+            )
 
-            self.wandb_run.finish()
-
-        return self.model
+        return str(self.output_dir)
 
 
 def main():
+    """Main training function using YAML config."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Fine-tune on hard negative triplets")
+    parser = argparse.ArgumentParser(
+        description="Train triplet model using YAML configuration"
+    )
     parser.add_argument(
-        "--model", type=str, default="models/baseline", help="Path to base model"
+        "--config",
+        required=True,
+        help="Path to experiment YAML config"
     )
     parser.add_argument(
         "--triplets",
-        type=str,
-        default="data/processed/hard_negatives.parquet",
-        help="Path to mined triplets",
+        required=True,
+        help="Path to triplet parquet file"
     )
     parser.add_argument(
-        "--output", type=str, default="models/triplet_refined", help="Output directory"
-    )
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--margin", type=float, default=0.5, help="Triplet margin")
-    parser.add_argument("--fp16", action="store_true", default=True)
-    parser.add_argument("--no-fp16", dest="fp16", action="store_false")
-    parser.add_argument(
-        "--wandb",
-        action="store_true",
-        default=True,
-        help="Enable Weights & Biases logging",
+        "--model",
+        help="Override model path (optional)"
     )
     parser.add_argument(
-        "--no-wandb",
-        dest="wandb",
-        action="store_false",
-        help="Disable Weights & Biases logging",
+        "--iteration",
+        type=int,
+        help="Iteration number (for loop)"
     )
     parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default="authorship-verification",
-        help="Wandb project name",
+        "--overrides",
+        nargs="*",
+        help="Config overrides: key=value"
     )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default=None,
-        help="Wandb entity (username or team)",
-    )
-
     args = parser.parse_args()
 
-    if not Path(args.model).exists():
-        logger.error(f"Model not found: {args.model}")
-        return
+    # Load config
+    logger.info(f"Loading config: {args.config}")
+    config = ExperimentConfig.from_yaml(args.config)
 
-    if not Path(args.triplets).exists():
-        logger.error(f"Triplet data not found: {args.triplets}")
-        logger.info("Please run miner.py first")
-        return
+    if args.overrides:
+        config = apply_overrides(config, args.overrides)
 
-    # Prepare wandb config
-    wandb_config = {
-        "enabled": args.wandb,
-        "project": args.wandb_project,
-        "entity": args.wandb_entity,
-    }
+    # Validate
+    errors = config.validate()
+    if errors:
+        logger.error("Config validation failed:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        sys.exit(1)
 
-    trainer = TripletTrainer(args.model, args.output, wandb_config=wandb_config)
-    trainer.train(
-        triplet_path=args.triplets,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        learning_rate=args.lr,
-        margin=args.margin,
-        fp16=args.fp16,
-        use_wandb=args.wandb,
+    # Set seeds
+    set_random_seeds(config.reproducibility.random_seed)
+
+    # Initialize wandb
+    wandb_run = None
+    if config.wandb.enabled:
+        git_info = get_git_info()
+        system_info = get_system_info()
+        wandb_run = init_wandb_with_metadata(config, git_info, system_info)
+
+    # Train
+    trainer = TripletTrainer(
+        config,
+        wandb_run,
+        model_path=args.model,
+        iteration=args.iteration
     )
+    model_path = trainer.train(args.triplets)
+
+    if wandb_run:
+        wandb_run.finish()
+
+    logger.info(f" Triplet training complete: {model_path}")
 
 
 if __name__ == "__main__":

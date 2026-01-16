@@ -2,32 +2,24 @@
 """
 Phase 2: Baseline Metric Learning Trainer
 Trains a RoBERTa-based bi-encoder with MultipleNegativesRankingLoss.
-
-NOW USING: YAML Config System
 """
 
 import os
-import sys
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import pandas as pd
 import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer, InputExample, losses, models
 from sentence_transformers.evaluation import EmbeddingSimilarityEvaluator
+from torch.utils.data import DataLoader
 from datetime import datetime
-
-# New config system
-from src.config_v2 import ExperimentConfig, apply_overrides
-from src.experiment_tracker import ExperimentTracker
-from src.wandb_utils import init_wandb_with_metadata, log_model_artifact
-from src.git_utils import get_git_info, require_clean_git
-from src.reproducibility import set_random_seeds, get_system_info, log_environment
 
 try:
     import wandb
+
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
@@ -50,6 +42,7 @@ class WandbCallback:
         """Called after each training step."""
         if self.run is not None:
             self.step += 1
+            # Log basic step info
             self.run.log(
                 {
                     "train/step": self.step,
@@ -61,6 +54,7 @@ class WandbCallback:
     def on_epoch_end(self, epoch, steps, evaluator_scores):
         """Called after each epoch."""
         if self.run is not None:
+            # Log evaluation scores
             if evaluator_scores:
                 for evaluator_name, score in evaluator_scores.items():
                     self.run.log(
@@ -86,6 +80,7 @@ class WandbEvaluator(EmbeddingSimilarityEvaluator):
         score = super().__call__(model, output_path, epoch, steps)
 
         if self.wandb_run is not None and score is not None:
+            # Log evaluation metrics
             self.wandb_run.log(
                 {
                     f"eval/{self.name}_cosine_spearman": score,
@@ -196,22 +191,21 @@ class BaselineTrainer:
 
     def __init__(
         self,
-        config: ExperimentConfig,
-        wandb_run: Optional["wandb.Run"] = None,
+        model_name: str = "roberta-base",
+        output_dir: str = "models/baseline",
+        max_seq_length: int = 512,
+        wandb_config: Optional[dict] = None,
     ):
-        """Initialize trainer with experiment config."""
-        self.config = config
-        self.wandb_run = wandb_run
-
-        # Extract commonly used values
-        self.output_dir = Path(config.baseline_training.output_dir)
+        self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.wandb_config = wandb_config or {}
+        self.wandb_run = None
 
         # Build bi-encoder with mean pooling
-        logger.info(f"Initializing model: {config.model.base_model}")
+        logger.info(f"Initializing model: {model_name}")
 
         word_embedding_model = models.Transformer(
-            config.model.base_model, max_seq_length=config.model.max_seq_length
+            model_name, max_seq_length=max_seq_length
         )
 
         pooling_model = models.Pooling(
@@ -227,33 +221,67 @@ class BaselineTrainer:
             f"Model initialized with {self.model.get_sentence_embedding_dimension()}D embeddings"
         )
 
-    def train(self):
-        """Train the model with MultipleNegativesRankingLoss using config."""
-        cfg = self.config.baseline_training
+    def train(
+        self,
+        train_path: str,
+        val_path: str,
+        batch_size: int = 64,
+        num_epochs: int = 1,
+        learning_rate: float = 2e-5,
+        warmup_steps: int = 1000,
+        fp16: bool = True,
+        checkpoint_save_steps: int = 5000,
+        use_wandb: bool = True,
+    ):
+        """Train the model with MultipleNegativesRankingLoss."""
+
+        # Initialize wandb if available and enabled
+        if use_wandb and WANDB_AVAILABLE and self.wandb_config.get("enabled", True):
+            self.wandb_run = wandb.init(
+                project=self.wandb_config.get("project", "authorship-verification"),
+                entity=self.wandb_config.get("entity"),
+                name=self.wandb_config.get("name")
+                or f"baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                tags=self.wandb_config.get("tags", []) + ["baseline", "phase2"],
+                notes=self.wandb_config.get("notes"),
+                config={
+                    "model_name": self.model.get_sentence_embedding_dimension(),
+                    "batch_size": batch_size,
+                    "num_epochs": num_epochs,
+                    "learning_rate": learning_rate,
+                    "warmup_steps": warmup_steps,
+                    "fp16": fp16,
+                    "loss": "MultipleNegativesRankingLoss",
+                    "loss_scale": 100.0,
+                    "loss_temperature": 0.01,
+                    "phase": "baseline_training",
+                },
+            )
+            logger.info(f"Wandb run initialized: {self.wandb_run.name}")
+        else:
+            self.wandb_run = None
+            if use_wandb and not WANDB_AVAILABLE:
+                logger.warning("Wandb not available. Install with: pip install wandb")
 
         logger.info("=" * 80)
         logger.info("Starting Baseline Training")
         logger.info("=" * 80)
 
         # Load datasets
-        train_dataset = AuthorshipDataset(self.config.data.train_path)
+        train_dataset = AuthorshipDataset(train_path)
 
         # Create dataloader
         train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=self.config.hardware.num_workers
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
         )
 
-        # Define loss: MultipleNegativesRankingLoss
-        train_loss = losses.MultipleNegativesRankingLoss(
-            self.model,
-            scale=cfg.loss.scale
-        )
+        # Define loss: MultipleNegativesRankingLoss (in-batch negatives)
+        # Scale = 1/temperature. Lower temperature (0.01) = higher scale (100.0)
+        # This creates a sharper softmax distribution, punishing close negatives harder
+        train_loss = losses.MultipleNegativesRankingLoss(self.model, scale=100.0)
 
         # Validation evaluator
-        val_dataset = ValidationDataset(self.config.data.val_path, num_pairs=1000)
+        val_dataset = ValidationDataset(val_path, num_pairs=1000)
         val_pairs, val_labels = val_dataset.generate_pairs()
 
         evaluator = WandbEvaluator(
@@ -266,17 +294,16 @@ class BaselineTrainer:
 
         # Calculate total steps
         steps_per_epoch = len(train_dataloader)
-        total_steps = steps_per_epoch * cfg.num_epochs
+        total_steps = steps_per_epoch * num_epochs
 
         logger.info(f"Training configuration:")
-        logger.info(f"  Batch size: {cfg.batch_size}")
-        logger.info(f"  Epochs: {cfg.num_epochs}")
+        logger.info(f"  Batch size: {batch_size}")
+        logger.info(f"  Epochs: {num_epochs}")
         logger.info(f"  Steps per epoch: {steps_per_epoch}")
         logger.info(f"  Total steps: {total_steps}")
-        logger.info(f"  Learning rate: {cfg.learning_rate}")
-        logger.info(f"  Warmup steps: {cfg.warmup_steps}")
-        logger.info(f"  FP16: {cfg.fp16}")
-        logger.info(f"  Loss scale: {cfg.loss.scale}")
+        logger.info(f"  Learning rate: {learning_rate}")
+        logger.info(f"  Warmup steps: {warmup_steps}")
+        logger.info(f"  FP16: {fp16}")
         logger.info(f"  Wandb: {self.wandb_run is not None}")
 
         # Log dataset info to wandb
@@ -295,133 +322,184 @@ class BaselineTrainer:
         self.model.fit(
             train_objectives=[(train_dataloader, train_loss)],
             evaluator=evaluator,
-            epochs=cfg.num_epochs,
-            warmup_steps=cfg.warmup_steps,
-            optimizer_params={"lr": cfg.learning_rate},
+            epochs=num_epochs,
+            warmup_steps=warmup_steps,
+            optimizer_params={"lr": learning_rate},
             output_path=str(self.output_dir),
             save_best_model=True,
             checkpoint_path=str(self.output_dir / "checkpoints"),
-            checkpoint_save_steps=cfg.checkpoint_save_steps,
+            checkpoint_save_steps=checkpoint_save_steps,
             checkpoint_save_total_limit=3,
-            use_amp=cfg.fp16,
+            use_amp=fp16,  # Automatic Mixed Precision for FP16
             show_progress_bar=True,
         )
 
         logger.info("=" * 80)
-        logger.info("Training Complete!")
-        logger.info(f"Model saved to: {self.output_dir}")
+        logger.info(f"Training complete! Model saved to {self.output_dir}")
         logger.info("=" * 80)
 
-        # Log model artifact to wandb
-        if self.wandb_run and self.config.wandb.log_model:
-            log_model_artifact(
-                self.wandb_run,
-                self.output_dir,
-                self.config.experiment.id,
-                artifact_type="baseline_model"
-            )
+        # Finish wandb run
+        if self.wandb_run is not None:
+            # Log final model artifact
+            if self.wandb_config.get("log_model", True):
+                artifact = wandb.Artifact(
+                    name=f"baseline-model",
+                    type="model",
+                    description="Baseline authorship verification model",
+                )
+                artifact.add_dir(str(self.output_dir))
+                self.wandb_run.log_artifact(artifact)
 
-        return str(self.output_dir)
+            self.wandb_run.finish()
+
+        return self.model
+
+    def load_model(self, model_path: str = None):
+        """Load a trained model."""
+        if model_path is None:
+            model_path = str(self.output_dir)
+
+        logger.info(f"Loading model from {model_path}")
+        self.model = SentenceTransformer(model_path)
+        return self.model
+
+
+def optimize_batch_size(vram_gb: int = 24) -> int:
+    """
+    Calculate optimal batch size for given VRAM.
+    RoBERTa-base with 512 seq length uses ~400MB per sample in fp16.
+    """
+    # Conservative estimate: 350MB per sample with fp16
+    mb_per_sample = 350
+    available_mb = vram_gb * 1024 * 0.8  # Use 80% of VRAM
+
+    batch_size = int(available_mb / mb_per_sample)
+
+    # Round to nearest power of 2 for efficiency
+    batch_size = 2 ** int(torch.log2(torch.tensor(batch_size)).item())
+
+    # Clamp to reasonable range
+    batch_size = max(16, min(batch_size, 128))
+
+    return batch_size
 
 
 def main():
-    """Main training function using YAML config."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Train baseline model using YAML configuration"
+        description="Train baseline authorship verification model"
     )
     parser.add_argument(
-        "--config",
-        required=True,
-        help="Path to experiment YAML config"
+        "--train-data",
+        type=str,
+        default="data/processed/train.parquet",
+        help="Path to training data",
     )
     parser.add_argument(
-        "--overrides",
-        nargs="*",
-        help="Config overrides: key=value (e.g., baseline_training.batch_size=32)"
+        "--val-data",
+        type=str,
+        default="data/processed/val.parquet",
+        help="Path to validation data",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="models/baseline",
+        help="Output directory for model",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size (auto-calculated if not specified)",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=1, help="Number of training epochs"
+    )
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument(
+        "--warmup-steps", type=int, default=1000, help="Number of warmup steps"
+    )
+    parser.add_argument(
+        "--fp16", action="store_true", default=True, help="Use mixed precision training"
+    )
+    parser.add_argument(
+        "--no-fp16",
+        dest="fp16",
+        action="store_false",
+        help="Disable mixed precision training",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        default=True,
+        help="Enable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        dest="wandb",
+        action="store_false",
+        help="Disable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="authorship-verification",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Wandb entity (username or team)",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Wandb run name",
+    )
+
     args = parser.parse_args()
 
-    # Load config
-    logger.info(f"Loading config: {args.config}")
-    config = ExperimentConfig.from_yaml(args.config)
+    # Check if training data exists
+    if not Path(args.train_data).exists():
+        logger.error(f"Training data not found: {args.train_data}")
+        logger.info("Please run preprocess.py first")
+        return
 
-    # Apply overrides
-    if args.overrides:
-        config = apply_overrides(config, args.overrides)
-        logger.warning(f"Applied {len(args.overrides)} config overrides")
+    # Auto-calculate batch size if not specified
+    if args.batch_size is None:
+        args.batch_size = optimize_batch_size(vram_gb=24)
+        logger.info(f"Auto-selected batch size: {args.batch_size}")
 
-    # Validate
-    errors = config.validate()
-    if errors:
-        logger.error("Config validation failed:")
-        for error in errors:
-            logger.error(f"  - {error}")
-        sys.exit(1)
+    # Prepare wandb config
+    wandb_config = {
+        "enabled": args.wandb,
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_name,
+    }
 
-    logger.info(f" Config validated: Experiment {config.experiment.id}")
-
-    # Check git state
-    if config.git.require_clean:
-        require_clean_git(strict=True)
-
-    # Set random seeds
-    set_random_seeds(
-        config.reproducibility.random_seed,
-        config.reproducibility.deterministic
+    # Initialize trainer
+    trainer = BaselineTrainer(
+        model_name="roberta-base",
+        output_dir=args.output_dir,
+        wandb_config=wandb_config,
     )
 
-    # Initialize experiment tracker
-    tracker = ExperimentTracker(config)
-    tracker.create_experiment_doc()
-    tracker.update_status("running")
-    tracker.log_start()
-
-    # Get metadata
-    git_info = get_git_info()
-    system_info = get_system_info()
-    if config.reproducibility.log_system_info:
-        log_environment()
-
-    # Initialize wandb
-    wandb_run = None
-    if config.wandb.enabled:
-        wandb_run = init_wandb_with_metadata(config, git_info, system_info)
-
     # Train
-    logger.info(f"Starting training for experiment {config.experiment.id}")
-    trainer = BaselineTrainer(config, wandb_run)
-    model_path = trainer.train()
-
-    logger.info(f"Training complete: {model_path}")
-
-    # Optionally run evaluation
-    if config.evaluation:
-        logger.info("Running automatic evaluation...")
-        try:
-            from evaluate import Evaluator
-            evaluator = Evaluator(config, wandb_run)
-            metrics = evaluator.evaluate()
-
-            # Update experiment doc with results
-            tracker.log_results(metrics, wandb_run.url if wandb_run else None)
-        except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
-            logger.warning("Skipping automatic evaluation")
-
-    # Finish
-    if wandb_run:
-        wandb_run.finish()
-
-    tracker.update_status("complete")
-
-    logger.info("=" * 80)
-    logger.info(f" Experiment {config.experiment.id} complete!")
-    logger.info(f" Results: {tracker.exp_doc_path}")
-    if wandb_run:
-        logger.info(f" Wandb: {wandb_run.url}")
-    logger.info("=" * 80)
+    trainer.train(
+        train_path=args.train_data,
+        val_path=args.val_data,
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        learning_rate=args.lr,
+        warmup_steps=args.warmup_steps,
+        fp16=args.fp16,
+        use_wandb=args.wandb,
+    )
 
 
 if __name__ == "__main__":
